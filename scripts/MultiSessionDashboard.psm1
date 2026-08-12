@@ -103,7 +103,7 @@ function Invoke-RdpWrapperInstaller {
         [Parameter(Mandatory)][string]$FilePath,
         [Parameter(Mandatory)][string]$WorkingDirectory,
         [string[]]$ArgumentList = @(),
-        [int]$TimeoutSeconds = 0
+        [int]$TimeoutSeconds = 300
     )
 
     $startParameters = @{
@@ -121,19 +121,19 @@ function Invoke-RdpWrapperInstaller {
     $process = Start-Process @startParameters
     if ($TimeoutSeconds -gt 0 -and -not $process.WaitForExit($TimeoutSeconds * 1000)) {
         $process.Kill()
-        throw "RDP Wrapper installer did not finish within $TimeoutSeconds seconds. Re-run with -RdpWrapperInstallTimeoutSeconds 0 for interactive/default installer mode, or pass installer-specific arguments with -RdpWrapperInstallArguments."
+        throw "RDP Wrapper installer did not finish within $TimeoutSeconds seconds. The upstream console install command is '-install -offline'; use -RdpWrapperInstallTimeoutSeconds to adjust the wait or -RdpWrapperInstallArguments to override."
     }
 
     if ($process.ExitCode -ne 0) {
-        throw "RDP Wrapper installer exited with code $($process.ExitCode). Re-run with -RdpWrapperInstallArguments @() for default interactive mode or provide arguments supported by this installer release."
+        throw "RDP Wrapper installer exited with code $($process.ExitCode). The upstream source supports '-install' for console installation and '-offline' to disable update checks; override with -RdpWrapperInstallArguments only if this release changes."
     }
 }
 
 function Install-RdpWrapper {
     param(
         [string]$Source = 'https://github.com/sergiye/rdpWrapper/releases/latest/download/rdpWrapper_x64.exe',
-        [string[]]$InstallArguments = @(),
-        [int]$InstallTimeoutSeconds = 0
+        [string[]]$InstallArguments = @('-install', '-offline'),
+        [int]$InstallTimeoutSeconds = 300
     )
     New-DirectoryIfMissing -Path $script:RdpWrapperRoot
     $extension = [IO.Path]::GetExtension(([Uri]$Source).AbsolutePath)

@@ -3,8 +3,8 @@
 param(
     [string]$InstallRoot = 'C:\Program Files\Muti Session Dashboard',
     [string]$RdpWrapperUri = 'https://github.com/sergiye/rdpWrapper/releases/latest/download/rdpWrapper_x64.exe',
-    [string[]]$RdpWrapperInstallArguments = @(),
-    [int]$RdpWrapperInstallTimeoutSeconds = 0,
+    [string[]]$RdpWrapperInstallArguments = @('-install', '-offline'),
+    [int]$RdpWrapperInstallTimeoutSeconds = 300,
     [string]$MoonlightUri = 'https://github.com/moonlight-stream/moonlight-qt/releases/latest/download/MoonlightPortable-x64.zip',
     [string]$SunshineUri = 'https://github.com/LizardByte/Sunshine/releases/latest/download/sunshine-windows-portable.zip',
     [Parameter(Mandatory=$false)][string]$AardwolfCliUri,

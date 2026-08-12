@@ -35,7 +35,7 @@ Set-ExecutionPolicy -Scope Process Bypass -Force
 powershell.exe -ExecutionPolicy Bypass -File "C:\Program Files\Muti Session Dashboard\Dashboard.ps1"
 ```
 
-RDP Wrapper runs in the release installer's default mode by default because some releases return a failure code when forced into `/S` silent mode. To pass explicit installer arguments, use `-RdpWrapperInstallArguments`; to enforce a timeout, use `-RdpWrapperInstallTimeoutSeconds` (the default `0` waits for installer completion).
+RDP Wrapper is installed with the upstream-supported console arguments `-install -offline`; the source code documents `-install` as the wrapper install command and treats `-offline` as the flag that disables update checks. To pass explicit installer arguments, use `-RdpWrapperInstallArguments`; to change the wait, use `-RdpWrapperInstallTimeoutSeconds`.
 
 The installer caches dependency archives under `C:\Program Files\Muti Session Dashboard\Config\Downloads` and reuses them on later runs, so repeated installs do not re-download files unnecessarily. Use `-RefreshDownloadCache` to clear the cache before installing.
 
