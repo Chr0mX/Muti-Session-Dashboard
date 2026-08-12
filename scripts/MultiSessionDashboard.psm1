@@ -66,14 +66,14 @@ function Invoke-DownloadFile {
     $cachePath = Join-Path $CacheDirectory (Get-SafeCacheFileName -Uri $Uri -Name $CacheName)
     if (-not $ForceDownload -and (Test-UsableDownload -Path $cachePath)) {
         Copy-Item -LiteralPath $cachePath -Destination $Destination -Force
-        Write-Host "Using cached download for $CacheName: $cachePath"
+        Write-Host "Using cached download for ${CacheName}: $cachePath"
         return $Destination
     }
 
     $partial = "$cachePath.partial"
     try {
         if (Test-Path -LiteralPath $partial) { Remove-Item -LiteralPath $partial -Force }
-        Write-Host "Downloading $CacheName from $Uri"
+        Write-Host "Downloading ${CacheName} from $Uri"
         Invoke-WebRequest -Uri $Uri -OutFile $partial -UseBasicParsing
         if (-not (Test-UsableDownload -Path $partial)) { throw "Downloaded file is empty: $Uri" }
         Move-Item -LiteralPath $partial -Destination $cachePath -Force
@@ -82,11 +82,11 @@ function Invoke-DownloadFile {
     } catch {
         if (Test-Path -LiteralPath $partial) { Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue }
         if (Test-UsableDownload -Path $cachePath) {
-            Write-Warning "Download failed for $CacheName; using cached copy at $cachePath. Error: $($_.Exception.Message)"
+            Write-Warning "Download failed for ${CacheName}; using cached copy at $cachePath. Error: $($_.Exception.Message)"
             Copy-Item -LiteralPath $cachePath -Destination $Destination -Force
             return $Destination
         }
-        throw "Download failed for $CacheName from $Uri and no cached copy is available. Place the file in '$cachePath' or re-run when the network is available. Error: $($_.Exception.Message)"
+        throw "Download failed for ${CacheName} from $Uri and no cached copy is available. Place the file in '$cachePath' or re-run when the network is available. Error: $($_.Exception.Message)"
     }
 }
 
