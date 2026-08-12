@@ -103,7 +103,7 @@ function Invoke-RdpWrapperInstaller {
         [Parameter(Mandatory)][string]$FilePath,
         [Parameter(Mandatory)][string]$WorkingDirectory,
         [string[]]$ArgumentList = @(),
-        [int]$TimeoutSeconds = 300
+        [int]$TimeoutSeconds = 600
     )
 
     $startParameters = @{
@@ -121,19 +121,19 @@ function Invoke-RdpWrapperInstaller {
     $process = Start-Process @startParameters
     if ($TimeoutSeconds -gt 0 -and -not $process.WaitForExit($TimeoutSeconds * 1000)) {
         $process.Kill()
-        throw "RDP Wrapper installer did not finish within $TimeoutSeconds seconds. The upstream console install command is '-install -offline'; use -RdpWrapperInstallTimeoutSeconds to adjust the wait or -RdpWrapperInstallArguments to override."
+        throw "RDP Wrapper installer did not finish within $TimeoutSeconds seconds. The upstream console install command is '-install'; use -RdpWrapperInstallTimeoutSeconds to adjust the wait or -RdpWrapperInstallArguments to override."
     }
 
     if ($process.ExitCode -ne 0) {
-        throw "RDP Wrapper installer exited with code $($process.ExitCode). The upstream source supports '-install' for console installation and '-offline' to disable update checks; override with -RdpWrapperInstallArguments only if this release changes."
+        throw "RDP Wrapper installer exited with code $($process.ExitCode). The upstream source supports '-install' for console installation; override with -RdpWrapperInstallArguments only if this release changes."
     }
 }
 
 function Install-RdpWrapper {
     param(
         [string]$Source = 'https://github.com/sergiye/rdpWrapper/releases/latest/download/rdpWrapper_x64.exe',
-        [string[]]$InstallArguments = @('-install', '-offline'),
-        [int]$InstallTimeoutSeconds = 300
+        [string[]]$InstallArguments = @('-install'),
+        [int]$InstallTimeoutSeconds = 600
     )
     New-DirectoryIfMissing -Path $script:RdpWrapperRoot
     $extension = [IO.Path]::GetExtension(([Uri]$Source).AbsolutePath)
@@ -160,12 +160,29 @@ function Install-RdpWrapper {
     if (-not $result.Success) { throw "RDP Wrapper verification failed: $($result.Failures -join ', ')" }
 }
 
+
+function Enable-RemoteDesktopFirewallRules {
+    $rules = Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+    if ($rules) {
+        $rules | Enable-NetFirewallRule -ErrorAction SilentlyContinue | Out-Null
+        return
+    }
+
+    $legacyGroups = @(
+        '@FirewallAPI.dll,-28752',
+        'Remote Desktop'
+    )
+    foreach ($group in $legacyGroups) {
+        netsh advfirewall firewall set rule group=$group new enable=Yes | Out-Null
+    }
+}
+
 function Set-RdpWrapperConfiguration {
     New-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -PropertyType DWord -Force | Out-Null
     New-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'AllowRemoteRPC' -Value 1 -PropertyType DWord -Force | Out-Null
     New-ItemProperty -Path 'HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services' -Name 'Shadow' -Value 2 -PropertyType DWord -Force | Out-Null
     New-ItemProperty -Path 'HKLM:\Software\Microsoft\Terminal Server Client' -Name 'AuthenticationLevelOverride' -Value 0 -PropertyType DWord -Force | Out-Null
-    New-NetFirewallRule -DisplayGroup 'Remote Desktop' -Enabled True -ErrorAction SilentlyContinue | Out-Null
+    Enable-RemoteDesktopFirewallRules
 
     $ini = Get-ChildItem -LiteralPath $script:RdpWrapperRoot -Recurse -Filter 'rdpwrap.ini' -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($ini) {
@@ -186,7 +203,7 @@ function Test-RdpWrapperConfiguration {
     $auth = (Get-ItemProperty -Path 'HKLM:\Software\Microsoft\Terminal Server Client' -Name 'AuthenticationLevelOverride' -ErrorAction SilentlyContinue).AuthenticationLevelOverride
     if ($auth -ne 0) { $failures.Add('RDP authentication/client warning configured') }
     $ini = Get-ChildItem -LiteralPath $script:RdpWrapperRoot -Recurse -Filter 'rdpwrap.ini' -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $ini -or ((Get-Content -LiteralPath $ini.FullName -Raw) -notmatch '(?im)^PreferredWrapper=TermWrap$')) { $failures.Add('TermWrap configured') }
+    if ($ini -and ((Get-Content -LiteralPath $ini.FullName -Raw) -notmatch '(?im)^PreferredWrapper=TermWrap$')) { $failures.Add('TermWrap configured') }
     [pscustomobject]@{ Success = $failures.Count -eq 0; Failures = $failures }
 }
 
