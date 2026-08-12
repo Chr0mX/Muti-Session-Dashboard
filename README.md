@@ -21,7 +21,7 @@ RDP Wrapper is installed separately at `C:\Program Files\RDP Wrapper` using `htt
 
 ## Scripts
 
-- `scripts/Install-MultiSessionDashboard.ps1` downloads, installs, configures, and verifies RDP Wrapper from the release executable, Moonlight Portable, Sunshine Portable, Aardwolf CLI/GUI, and the dashboard.
+- `scripts/Install-MultiSessionDashboard.ps1` downloads, silently installs, configures, and verifies RDP Wrapper from the release executable, Moonlight Portable, Sunshine Portable, Aardwolf CLI/GUI, and the dashboard.
 - `scripts/Dashboard.ps1` provides the operator dashboard with Create User, Start, Connect RDP, Connect Moonlight, Stop, and Refresh actions.
 - `scripts/MultiSessionDashboard.psm1` contains the reusable implementation for dependency verification, user creation, per-user Sunshine isolation, port allocation, Aardwolf integration, and Moonlight launching.
 
@@ -34,6 +34,8 @@ Set-ExecutionPolicy -Scope Process Bypass -Force
 .\scripts\Install-MultiSessionDashboard.ps1
 powershell.exe -ExecutionPolicy Bypass -File "C:\Program Files\Muti Session Dashboard\Dashboard.ps1"
 ```
+
+RDP Wrapper runs with silent installer arguments by default (`/S`) so the installer does not pause for manual clicks; override with `-RdpWrapperSilentInstallArguments` if a future release changes its silent mode. The installer also times out this step by default instead of waiting forever; override with `-RdpWrapperInstallTimeoutSeconds` when needed.
 
 The installer caches dependency archives under `C:\Program Files\Muti Session Dashboard\Config\Downloads` and reuses them on later runs, so repeated installs do not re-download files unnecessarily. Use `-RefreshDownloadCache` to clear the cache before installing.
 

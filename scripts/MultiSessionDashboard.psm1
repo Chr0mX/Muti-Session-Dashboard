@@ -98,21 +98,37 @@ function Expand-ArchiveSafe {
 }
 
 function Install-RdpWrapper {
-    param([string]$Source = 'https://github.com/sergiye/rdpWrapper/releases/latest/download/rdpWrapper_x64.exe')
+    param(
+        [string]$Source = 'https://github.com/sergiye/rdpWrapper/releases/latest/download/rdpWrapper_x64.exe',
+        [string[]]$SilentInstallArguments = @('/S'),
+        [int]$InstallTimeoutSeconds = 300
+    )
     New-DirectoryIfMissing -Path $script:RdpWrapperRoot
     $extension = [IO.Path]::GetExtension(([Uri]$Source).AbsolutePath)
     if ([string]::IsNullOrWhiteSpace($extension)) { $extension = '.download' }
     $package = Join-Path $env:TEMP "rdpWrapper$extension"
-    Invoke-DownloadFile -Uri $Source -Destination $package -CacheName 'rdpWrapper'
+    Invoke-DownloadFile -Uri $Source -Destination $package -CacheName 'rdpWrapper' | Out-Null
 
     if ($extension -ieq '.zip') {
         Expand-ArchiveSafe -Archive $package -Destination $script:RdpWrapperRoot
         $install = Get-ChildItem -LiteralPath $script:RdpWrapperRoot -Recurse -Filter 'install.bat' -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($install) { Start-Process -FilePath $install.FullName -WorkingDirectory $install.DirectoryName -Wait -Verb RunAs }
+        if ($install) {
+            $process = Start-Process -FilePath $install.FullName -WorkingDirectory $install.DirectoryName -ArgumentList $SilentInstallArguments -PassThru
+            if (-not $process.WaitForExit($InstallTimeoutSeconds * 1000)) {
+                $process.Kill()
+                throw "RDP Wrapper batch installer did not finish within $InstallTimeoutSeconds seconds."
+            }
+            if ($process.ExitCode -ne 0) { throw "RDP Wrapper batch installer exited with code $($process.ExitCode)." }
+        }
     } elseif ($extension -ieq '.exe') {
         $installer = Join-Path $script:RdpWrapperRoot 'rdpWrapper_x64.exe'
         Copy-Item -LiteralPath $package -Destination $installer -Force
-        Start-Process -FilePath $installer -WorkingDirectory $script:RdpWrapperRoot -Wait -Verb RunAs
+        $process = Start-Process -FilePath $installer -WorkingDirectory $script:RdpWrapperRoot -ArgumentList $SilentInstallArguments -PassThru
+        if (-not $process.WaitForExit($InstallTimeoutSeconds * 1000)) {
+            $process.Kill()
+            throw "RDP Wrapper installer did not finish within $InstallTimeoutSeconds seconds. Check the silent arguments or run with -RdpWrapperSilentInstallArguments set for this release."
+        }
+        if ($process.ExitCode -ne 0) { throw "RDP Wrapper installer exited with code $($process.ExitCode)." }
     } else {
         throw "Unsupported RDP Wrapper package type '$extension' from $Source"
     }
@@ -155,7 +171,7 @@ function Test-RdpWrapperConfiguration {
 function Install-PortableZip {
     param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][string]$Uri, [Parameter(Mandatory)][string]$Destination)
     $zip = Join-Path $env:TEMP "$Name.zip"
-    Invoke-DownloadFile -Uri $Uri -Destination $zip -CacheName $Name
+    Invoke-DownloadFile -Uri $Uri -Destination $zip -CacheName $Name | Out-Null
     Expand-ArchiveSafe -Archive $zip -Destination $Destination
 }
 
