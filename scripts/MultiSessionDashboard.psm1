@@ -5,8 +5,19 @@ $script:RdpWrapperRoot = 'C:\Program Files\RDP Wrapper'
 $script:ConfigRoot = Join-Path $script:InstallRoot 'Config'
 $script:UsersRoot = Join-Path $script:InstallRoot 'Users'
 $script:StateFile = Join-Path $script:ConfigRoot 'sessions.json'
+$script:DownloadCacheRoot = Join-Path $script:ConfigRoot 'Downloads'
 $script:PortStart = 47989
 $script:PortEnd = 48050
+
+
+function Set-DashboardPaths {
+    param([Parameter(Mandatory)][string]$InstallRoot)
+    $script:InstallRoot = $InstallRoot
+    $script:ConfigRoot = Join-Path $script:InstallRoot 'Config'
+    $script:UsersRoot = Join-Path $script:InstallRoot 'Users'
+    $script:StateFile = Join-Path $script:ConfigRoot 'sessions.json'
+    $script:DownloadCacheRoot = Join-Path $script:ConfigRoot 'Downloads'
+}
 
 function Assert-Administrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -23,14 +34,60 @@ function New-DirectoryIfMissing {
     }
 }
 
+function Get-SafeCacheFileName {
+    param([Parameter(Mandatory)][string]$Uri, [Parameter(Mandatory)][string]$Name)
+    $extension = [IO.Path]::GetExtension(([Uri]$Uri).AbsolutePath)
+    if ([string]::IsNullOrWhiteSpace($extension)) { $extension = '.download' }
+    $hashInput = [Text.Encoding]::UTF8.GetBytes($Uri)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $hash = ([BitConverter]::ToString($sha.ComputeHash($hashInput))).Replace('-', '').Substring(0, 12).ToLowerInvariant()
+    return "$Name-$hash$extension"
+}
+
+function Test-UsableDownload {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    $item = Get-Item -LiteralPath $Path
+    return ($item.Length -gt 0)
+}
+
 function Invoke-DownloadFile {
     param(
         [Parameter(Mandatory)][string]$Uri,
-        [Parameter(Mandatory)][string]$Destination
+        [Parameter(Mandatory)][string]$Destination,
+        [Parameter(Mandatory)][string]$CacheName,
+        [string]$CacheDirectory = $script:DownloadCacheRoot,
+        [switch]$ForceDownload
     )
+
     New-DirectoryIfMissing -Path (Split-Path -Parent $Destination)
-    Invoke-WebRequest -Uri $Uri -OutFile $Destination -UseBasicParsing
-    if (-not (Test-Path -LiteralPath $Destination)) { throw "Download failed: $Uri" }
+    New-DirectoryIfMissing -Path $CacheDirectory
+
+    $cachePath = Join-Path $CacheDirectory (Get-SafeCacheFileName -Uri $Uri -Name $CacheName)
+    if (-not $ForceDownload -and (Test-UsableDownload -Path $cachePath)) {
+        Copy-Item -LiteralPath $cachePath -Destination $Destination -Force
+        Write-Host "Using cached download for $CacheName: $cachePath"
+        return $Destination
+    }
+
+    $partial = "$cachePath.partial"
+    try {
+        if (Test-Path -LiteralPath $partial) { Remove-Item -LiteralPath $partial -Force }
+        Write-Host "Downloading $CacheName from $Uri"
+        Invoke-WebRequest -Uri $Uri -OutFile $partial -UseBasicParsing
+        if (-not (Test-UsableDownload -Path $partial)) { throw "Downloaded file is empty: $Uri" }
+        Move-Item -LiteralPath $partial -Destination $cachePath -Force
+        Copy-Item -LiteralPath $cachePath -Destination $Destination -Force
+        return $Destination
+    } catch {
+        if (Test-Path -LiteralPath $partial) { Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue }
+        if (Test-UsableDownload -Path $cachePath) {
+            Write-Warning "Download failed for $CacheName; using cached copy at $cachePath. Error: $($_.Exception.Message)"
+            Copy-Item -LiteralPath $cachePath -Destination $Destination -Force
+            return $Destination
+        }
+        throw "Download failed for $CacheName from $Uri and no cached copy is available. Place the file in '$cachePath' or re-run when the network is available. Error: $($_.Exception.Message)"
+    }
 }
 
 function Expand-ArchiveSafe {
@@ -43,7 +100,7 @@ function Expand-ArchiveSafe {
 function Install-RdpWrapper {
     param([string]$Source = 'https://github.com/sergiye/rdpWrapper/archive/refs/heads/master.zip')
     $zip = Join-Path $env:TEMP 'rdpWrapper.zip'
-    Invoke-DownloadFile -Uri $Source -Destination $zip
+    Invoke-DownloadFile -Uri $Source -Destination $zip -CacheName 'rdpWrapper'
     Expand-ArchiveSafe -Archive $zip -Destination $script:RdpWrapperRoot
 
     $install = Get-ChildItem -LiteralPath $script:RdpWrapperRoot -Recurse -Filter 'install.bat' -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -87,7 +144,7 @@ function Test-RdpWrapperConfiguration {
 function Install-PortableZip {
     param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][string]$Uri, [Parameter(Mandatory)][string]$Destination)
     $zip = Join-Path $env:TEMP "$Name.zip"
-    Invoke-DownloadFile -Uri $Uri -Destination $zip
+    Invoke-DownloadFile -Uri $Uri -Destination $zip -CacheName $Name
     Expand-ArchiveSafe -Archive $zip -Destination $Destination
 }
 
@@ -115,13 +172,35 @@ function Install-AardwolfComponents {
     if (-not (Test-Path -LiteralPath (Join-Path $dest 'AardwolfGUI.exe'))) { throw 'AardwolfGUI.exe was not found after extraction.' }
 }
 
+function ConvertTo-HashtableRecursive {
+    param([Parameter(ValueFromPipeline)]$InputObject)
+    process {
+        if ($null -eq $InputObject) { return $null }
+        if ($InputObject -is [hashtable]) { return $InputObject }
+        if ($InputObject -is [System.Collections.IDictionary]) {
+            $hash = @{}
+            foreach ($key in $InputObject.Keys) { $hash[$key] = ConvertTo-HashtableRecursive $InputObject[$key] }
+            return $hash
+        }
+        if ($InputObject -is [System.Collections.IEnumerable] -and $InputObject -isnot [string]) {
+            return @($InputObject | ForEach-Object { ConvertTo-HashtableRecursive $_ })
+        }
+        if ($InputObject -is [pscustomobject]) {
+            $hash = @{}
+            foreach ($property in $InputObject.PSObject.Properties) { $hash[$property.Name] = ConvertTo-HashtableRecursive $property.Value }
+            return $hash
+        }
+        return $InputObject
+    }
+}
+
 function Get-DashboardState {
     New-DirectoryIfMissing -Path $script:ConfigRoot
     if (-not (Test-Path -LiteralPath $script:StateFile)) { return @{} }
     $json = Get-Content -LiteralPath $script:StateFile -Raw
     if ([string]::IsNullOrWhiteSpace($json)) { return @{} }
-    $obj = $json | ConvertFrom-Json -AsHashtable
-    return $obj
+    $obj = $json | ConvertFrom-Json
+    return (ConvertTo-HashtableRecursive $obj)
 }
 
 function Save-DashboardState { param([hashtable]$State) $State | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $script:StateFile -Encoding UTF8 }
@@ -249,4 +328,4 @@ function Test-DashboardInstallation {
     $checks.GetEnumerator() | ForEach-Object { [pscustomobject]@{ Check=$_.Key; Passed=[bool]$_.Value } }
 }
 
-Export-ModuleMember -Function *-Dashboard*,Install-*,Test-*,New-DashboardUser,Start-DashboardSession,Stop-DashboardSession,Connect-DashboardRdp,Connect-DashboardMoonlight,Assert-Administrator
+Export-ModuleMember -Function *-Dashboard*,Install-*,Test-*,New-DashboardUser,Start-DashboardSession,Stop-DashboardSession,Connect-DashboardRdp,Connect-DashboardMoonlight,Assert-Administrator,Set-DashboardPaths

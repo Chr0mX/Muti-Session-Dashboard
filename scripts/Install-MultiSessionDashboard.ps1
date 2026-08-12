@@ -6,12 +6,18 @@ param(
     [string]$MoonlightUri = 'https://github.com/moonlight-stream/moonlight-qt/releases/latest/download/MoonlightPortable-x64.zip',
     [string]$SunshineUri = 'https://github.com/LizardByte/Sunshine/releases/latest/download/sunshine-windows-portable.zip',
     [Parameter(Mandatory=$false)][string]$AardwolfCliUri,
-    [Parameter(Mandatory=$false)][string]$AardwolfGuiUri
+    [Parameter(Mandatory=$false)][string]$AardwolfGuiUri,
+    [switch]$RefreshDownloadCache
 )
 
 $ErrorActionPreference = 'Stop'
 $modulePath = Join-Path $PSScriptRoot 'MultiSessionDashboard.psm1'
 Import-Module $modulePath -Force
+Set-DashboardPaths -InstallRoot $InstallRoot
+if ($RefreshDownloadCache) {
+    $cachePath = Join-Path $InstallRoot 'Config\Downloads'
+    if (Test-Path -LiteralPath $cachePath) { Remove-Item -LiteralPath $cachePath -Recurse -Force }
+}
 
 Assert-Administrator
 
