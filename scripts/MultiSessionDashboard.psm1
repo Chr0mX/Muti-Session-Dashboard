@@ -8,6 +8,9 @@ $script:StateFile = Join-Path $script:ConfigRoot 'sessions.json'
 $script:DownloadCacheRoot = Join-Path $script:ConfigRoot 'Downloads'
 $script:PortStart = 47989
 $script:PortEnd = 48050
+$script:RdpHost = '127.0.0.2'
+$script:RdpPlusPath = 'C:\Program Files (x86)\Remote Desktop Plus\rdp.exe'
+$script:RdpPort = 3389
 
 
 function Set-DashboardPaths {
@@ -256,23 +259,347 @@ function Install-MoonlightPortable {
 function Install-SunshinePortable {
     param(
         [string]$ReleaseApiUri = 'https://api.github.com/repos/LizardByte/Sunshine/releases/latest',
-        [string[]]$AssetNamePatterns = @('(?i)^sunshine-windows-portable\.zip$', '(?i)^sunshine-windows.*portable.*\.zip$', '(?i)^sunshine.*windows.*portable.*\.zip$', '(?i)^sunshine.*portable.*windows.*\.zip$')
+        [string[]]$AssetNamePatterns = @(
+            '(?i)^Sunshine-Windows-AMD64-portable\.zip$',
+            '(?i)^Sunshine-Windows.*portable.*\.zip$',
+            '(?i)^Sunshine.*Windows.*portable.*\.zip$',
+            '(?i)^Sunshine.*portable.*Windows.*\.zip$'
+        )
     )
-    $asset = Resolve-GitHubLatestReleaseAsset -ReleaseApiUri $ReleaseApiUri -AssetNamePatterns $AssetNamePatterns -ComponentName 'Sunshine Portable'
-    Install-PortableZip -Name 'sunshine' -Uri $asset.Uri -Destination (Join-Path $script:InstallRoot 'Stream\Sunshine')
-    if (-not (Test-Path -LiteralPath (Join-Path $script:InstallRoot 'Stream\Sunshine\Sunshine.exe'))) { throw 'Sunshine.exe was not found after extraction.' }
+
+    $destination = Join-Path $script:InstallRoot 'Stream\Sunshine'
+
+    Write-Host 'Installing Sunshine Portable master copy...'
+
+    $asset = Resolve-GitHubLatestReleaseAsset `
+        -ReleaseApiUri $ReleaseApiUri `
+        -AssetNamePatterns $AssetNamePatterns `
+        -ComponentName 'Sunshine Portable'
+
+    Install-PortableZip `
+        -Name 'sunshine' `
+        -Uri $asset.Uri `
+        -Destination $destination
+
+    # Find the actual Sunshine executable anywhere in the extracted archive.
+    $sunshineExe = Get-ChildItem `
+        -LiteralPath $destination `
+        -Recurse `
+        -Filter 'sunshine.exe' `
+        -File `
+        -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+
+    if (-not $sunshineExe) {
+        throw "Sunshine.exe was not found after extraction under '$destination'."
+    }
+
+    # If the ZIP contains a nested Sunshine directory, flatten it.
+    if ($sunshineExe.Directory.FullName -ne $destination) {
+        $sourceDirectory = $sunshineExe.Directory.FullName
+
+        Write-Host "Flattening Sunshine Portable directory:"
+        Write-Host "  $sourceDirectory"
+        Write-Host "  -> $destination"
+
+        Get-ChildItem -LiteralPath $sourceDirectory -Force |
+            Move-Item -Destination $destination -Force
+
+        # Remove the now-empty nested directory.
+        if (Test-Path -LiteralPath $sourceDirectory) {
+            Remove-Item -LiteralPath $sourceDirectory -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    $expectedExe = Join-Path $destination 'sunshine.exe'
+
+    if (-not (Test-Path -LiteralPath $expectedExe)) {
+        throw "Sunshine.exe was not found at expected path '$expectedExe'."
+    }
+
+    Write-Host "Sunshine Portable installed successfully."
+    Write-Host "Executable: $expectedExe"
 }
 
-function Install-AardwolfComponents {
-    param(
-        [string]$CliUri = 'https://github.com/tsl0922/ttyd/releases/latest/download/aardwolf-windows-x64.zip',
-        [string]$GuiUri = 'https://github.com/tsl0922/ttyd/releases/latest/download/aardwolf-gui-windows-x64.zip'
+function Test-TsconAvailable {
+    $tscon = Join-Path $env:SystemRoot 'System32\tscon.exe'
+    return (Test-Path -LiteralPath $tscon)
+}
+
+function Get-RemoteDesktopUsers {
+    <#
+        Returns direct members of the local "Remote Desktop Users" group.
+        Uses Get-LocalGroupMember when available and falls back to the
+        built-in Windows WinNT provider so detection works without the
+        LocalAccounts PowerShell module.
+    #>
+    $members = [System.Collections.Generic.List[object]]::new()
+    $cmd = Get-Command -Name Get-LocalGroupMember -ErrorAction SilentlyContinue
+
+    if ($null -ne $cmd) {
+        try {
+            foreach ($member in @(Get-LocalGroupMember -Group 'Remote Desktop Users' -ErrorAction Stop)) {
+                $accountName = [string]$member.Name
+                if ([string]::IsNullOrWhiteSpace($accountName)) { continue }
+
+                $displayName = $accountName
+                if ($displayName -match '^[^\\]+\\(.+)$') { $displayName = $matches[1] }
+
+                $members.Add([pscustomobject]@{
+                    Username        = $displayName
+                    AccountName     = $accountName
+                    PrincipalSource = [string]$member.PrincipalSource
+                    ObjectClass     = [string]$member.ObjectClass
+                })
+            }
+            return @($members | Sort-Object Username, AccountName -Unique)
+        }
+        catch {
+            Write-Verbose "Get-LocalGroupMember failed; falling back to WinNT provider. $($_.Exception.Message)"
+        }
+    }
+
+    try {
+        $group = [ADSI]'WinNT://./Remote Desktop Users,group'
+        foreach ($member in @($group.psbase.Invoke('Members'))) {
+            try {
+                $accountName = [string]$member.GetType().InvokeMember(
+                    'Name', [System.Reflection.BindingFlags]::GetProperty, $null, $member, $null)
+
+                if ([string]::IsNullOrWhiteSpace($accountName)) { continue }
+
+                $className = ''
+                $adsPath = ''
+                try {
+                    $className = [string]$member.GetType().InvokeMember(
+                        'Class', [System.Reflection.BindingFlags]::GetProperty, $null, $member, $null)
+                } catch {}
+                try {
+                    $adsPath = [string]$member.GetType().InvokeMember(
+                        'ADsPath', [System.Reflection.BindingFlags]::GetProperty, $null, $member, $null)
+                } catch {}
+
+                $displayName = $accountName
+                $qualifiedName = $accountName
+
+                if ($adsPath -match '^WinNT://([^/]+)/(.+)$') {
+                    $displayName = $matches[2]
+                    $qualifiedName = "$($matches[1])\$($matches[2])"
+                }
+
+                $source = 'Unknown'
+                if ($qualifiedName -match '^([^\\]+)\\') { $source = $matches[1] }
+
+                $members.Add([pscustomobject]@{
+                    Username        = $displayName
+                    AccountName     = $qualifiedName
+                    PrincipalSource = $source
+                    ObjectClass     = $className
+                })
+            }
+            catch {
+                Write-Verbose "Could not read one Remote Desktop Users member: $($_.Exception.Message)"
+            }
+        }
+    }
+    catch {
+        throw "Could not read members of the local 'Remote Desktop Users' group. $($_.Exception.Message)"
+    }
+
+    return @($members | Sort-Object Username, AccountName -Unique)
+}
+
+function Get-DashboardUsers {
+    # Sync dashboard state with the current Remote Desktop Users group.
+    $state = Get-DashboardState
+    $users = @(Get-RemoteDesktopUsers)
+
+    foreach ($user in $users) {
+        if (-not $state.ContainsKey($user.Username)) {
+            $state[$user.Username] = @{
+                Username = $user.Username
+                AccountName = $user.AccountName
+                SunshinePort = $null
+                SessionState = 'Stopped'
+                SunshineState = 'Stopped'
+                RdpSessionId = $null
+                RdpConnectionStatus = 'Disconnected'
+            }
+        } else {
+            $state[$user.Username].Username = $user.Username
+            $state[$user.Username].AccountName = $user.AccountName
+        }
+    }
+
+    Save-DashboardState -State $state
+    return $users
+}
+
+function Get-RdpEndpoint {
+    return "$($script:RdpHost):$($script:RdpPort)"
+}
+
+function Get-UserSessions {
+    param([Parameter(Mandatory)][string]$Username)
+    $sessions = @()
+    foreach ($line in @(quser 2>$null)) {
+        $text = [string]$line
+        if ($text -match '^\s*>?\s*(\S+)(?:\s+(\S+))?\s+(\d+)\s+(\S+)') {
+            $user = $matches[1]; $sessionName = if ($matches[2] -match '^rdp-tcp|^console$') { $matches[2] } else { '' }; $id = [int]$matches[3]; $state = $matches[4]
+            if ($user -ieq $Username) {
+                $sessions += [pscustomobject]@{ Username=$user; SessionId=$id; SessionName=$sessionName; State=$state; Online=($state -match '^(Active|Conn)$'); IsRdp=($sessionName -like 'rdp-tcp*'); IsConsole=($sessionName -ieq 'console') }
+            }
+        }
+    }
+    return @($sessions)
+}
+
+function Get-UserSession {
+    param([Parameter(Mandatory)][string]$Username)
+    $sessions = @(Get-UserSessions -Username $Username)
+    if ($sessions.Count -eq 0) { return $null }
+    $console = $sessions | Where-Object { $_.IsConsole -and $_.Online } | Select-Object -First 1
+    if ($null -ne $console) { return $console }
+    $active = $sessions | Where-Object { $_.Online } | Select-Object -First 1
+    if ($null -ne $active) { return $active }
+    return ($sessions | Select-Object -First 1)
+}
+
+function Get-UserRdpSessionId {
+    param([Parameter(Mandatory)][string]$Username)
+    return @(Get-UserSessions -Username $Username | Where-Object { $_.IsRdp } | Sort-Object SessionId | Select-Object -First 1)
+}
+
+function Get-UserConsoleSession {
+    param([Parameter(Mandatory)][string]$Username)
+    return @(Get-UserSessions -Username $Username | Where-Object { $_.IsConsole } | Sort-Object SessionId | Select-Object -First 1)
+}
+
+function Wait-DashboardRdpSession {
+    param([Parameter(Mandatory)][string]$Username,[int]$TimeoutSeconds=30,[int[]]$IgnoreSessionIds=@())
+    $deadline=(Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        $session=@(Get-UserSessions -Username $Username | Where-Object { $_.IsRdp -and $_.State -match '^(Active|Conn)$' -and ($IgnoreSessionIds -notcontains $_.SessionId) } | Sort-Object SessionId | Select-Object -First 1)
+        if ($null -ne $session -and @($session).Count -gt 0) { return $session[0] }
+        Start-Sleep -Milliseconds 500
+    } while ((Get-Date) -lt $deadline)
+    return $null
+}
+
+function Invoke-TsconToConsole {
+    param([Parameter(Mandatory)][int]$SessionId)
+    Assert-Administrator
+    $tscon=Join-Path $env:SystemRoot 'System32\tscon.exe'
+    if (-not (Test-Path -LiteralPath $tscon)) { throw "tscon.exe was not found at '$tscon'." }
+    & $tscon $SessionId /dest:console 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "tscon failed for session $SessionId with exit code $LASTEXITCODE." }
+}
+
+function Maintain-DashboardSession {
+    param([Parameter(Mandatory)][string]$Username)
+    Assert-Administrator
+    $sessions=@(Get-UserSessions -Username $Username)
+    if ($sessions.Count -eq 0) { return $null }
+
+    # Do not interrupt a live GUI RDP connection. When the client disconnects,
+    # hand that disconnected RDP session to the console so the user session
+    # remains alive for Sunshine/Moonlight.
+    $disconnectedRdp=$sessions | Where-Object { $_.IsRdp -and $_.State -match '^(Disc|Disconnected)$' } | Sort-Object SessionId | Select-Object -First 1
+    if ($null -ne $disconnectedRdp) {
+        $console = $sessions | Where-Object { $_.IsConsole -and $_.Online } | Select-Object -First 1
+        if ($null -ne $console) {
+            # The preserved console session is already alive. Do not create a
+            # second console session; remove the stale disconnected RDP login.
+            logoff $disconnectedRdp.SessionId 2>$null
+        } else {
+            # No console session exists, so tscon the disconnected RDP session
+            # back to console to revive the user's desktop without logging off.
+            Invoke-TsconToConsole -SessionId $disconnectedRdp.SessionId
+            Start-Sleep -Milliseconds 500
+        }
+    }
+    return (Get-UserSession -Username $Username)
+}
+
+function Keep-DashboardRdpSessionAlive {
+    param([Parameter(Mandatory)][string]$Username)
+    $session=Get-UserRdpSessionId -Username $Username | Select-Object -First 1
+    if ($null -eq $session) { throw "No RDP session was found for '$Username'." }
+    Invoke-TsconToConsole -SessionId $session.SessionId
+    Start-Sleep -Milliseconds 500
+    $console=Get-UserConsoleSession -Username $Username | Select-Object -First 1
+    if ($null -eq $console -or -not $console.Online) { throw "tscon completed for '$Username', but the console session is not Active." }
+    return $console.SessionId
+}
+
+function Invoke-DashboardRdpPlusBootstrap {
+    param([Parameter(Mandatory)][string]$Username)
+
+    Assert-Administrator
+
+    $rdpPlus = $script:RdpPlusPath
+    if (-not (Test-Path -LiteralPath $rdpPlus)) {
+        throw "Remote Desktop Plus was not found at '$rdpPlus'. Install Remote Desktop Plus before using Start."
+    }
+
+    # Dashboard-created accounts use the username as the initial password.
+    # Do not use cmdkey here: RDP Plus receives the credentials explicitly.
+    # /w and /h force the bootstrap RDP connection to 1920x1080.
+    $arguments = @(
+        '/v:127.0.0.2:3389',
+        "/u:.\$Username",
+        "/p:$Username",
+        '/w:1920',
+        '/h:1080'
     )
-    $dest = Join-Path $script:InstallRoot 'Aardwolf'
-    Install-PortableZip -Name 'aardwolf' -Uri $CliUri -Destination $dest
-    Install-PortableZip -Name 'aardwolf-gui' -Uri $GuiUri -Destination $dest
-    if (-not (Test-Path -LiteralPath (Join-Path $dest 'Aardwolf.exe'))) { throw 'Aardwolf.exe was not found after extraction.' }
-    if (-not (Test-Path -LiteralPath (Join-Path $dest 'AardwolfGUI.exe'))) { throw 'AardwolfGUI.exe was not found after extraction.' }
+
+    Write-Host "Starting Remote Desktop Plus for '$Username' at 1920x1080."
+    Start-Process -FilePath $rdpPlus -ArgumentList $arguments | Out-Null
+
+    $session = Wait-DashboardRdpSession -Username $Username -TimeoutSeconds 30
+    if ($null -eq $session) {
+        throw "Remote Desktop Plus did not create an active RDP session for '$Username' within 30 seconds."
+    }
+
+    return $session
+}
+
+function Invoke-DashboardRdpBootstrap {
+    param([Parameter(Mandatory)][string]$Username)
+
+    Assert-Administrator
+    $alias = Ensure-DashboardRdpAlias -Username $Username
+    if (-not (Test-DashboardRdpCredential -Username $Username)) {
+        throw "No saved RDP credential exists for '$Username'. Create the user through the dashboard again with a password, or configure the dashboard credential first."
+    }
+
+    $mstsc = Join-Path $env:SystemRoot 'System32\mstsc.exe'
+    if (-not (Test-Path -LiteralPath $mstsc)) { throw "mstsc.exe was not found at '$mstsc'." }
+
+    # Bootstrap a real RDP session at exactly 1920x1080. The saved credential
+    # is supplied by Windows Credential Manager; no password is placed on the
+    # mstsc command line.
+    Start-Process -FilePath $mstsc -ArgumentList @("/v:${alias}:3389",'/w:1920','/h:1080') | Out-Null
+    $session = Wait-DashboardRdpSession -Username $Username -TimeoutSeconds 30
+    if ($null -eq $session) {
+        throw "RDP login for '$Username' did not produce an active RDP session within 30 seconds."
+    }
+    return $session
+}
+
+function Keep-DashboardRdpSessionAlive {
+    param([Parameter(Mandatory)][string]$Username)
+
+    Assert-Administrator
+    $tscon = Join-Path $env:SystemRoot 'System32\tscon.exe'
+    if (-not (Test-Path -LiteralPath $tscon)) { throw "tscon.exe was not found at '$tscon'." }
+
+    $session = Get-UserRdpSessionId -Username $Username
+    if ($null -eq $session) { throw "No active RDP session was found for '$Username'." }
+
+    & $tscon $session.SessionId /dest:console 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "tscon failed for session $($session.SessionId) with exit code $LASTEXITCODE." }
+    return $session.SessionId
 }
 
 function ConvertTo-HashtableRecursive {
@@ -313,6 +640,52 @@ function Test-BlankPasswordRdpPolicy {
     [pscustomobject]@{ AllowsBlankPasswordRdp = ($value -eq 0); PolicyValue = $value }
 }
 
+function Get-DashboardRdpAlias {
+    param([Parameter(Mandatory)][string]$Username)
+    $safe = ($Username -replace '[^a-zA-Z0-9-]', '-')
+    return "msd-$safe.rdp.local"
+}
+
+function Ensure-DashboardRdpAlias {
+    param([Parameter(Mandatory)][string]$Username)
+    Assert-Administrator
+    $alias = Get-DashboardRdpAlias -Username $Username
+    $hosts = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
+    $lines = @(Get-Content -LiteralPath $hosts -ErrorAction Stop)
+    $pattern = '^\s*127\.0\.0\.1\s+' + [regex]::Escape($alias) + '(?:\s|$)'
+    if (-not ($lines -match $pattern)) {
+        Add-Content -LiteralPath $hosts -Value "`r`n127.0.0.1 $alias"
+        ipconfig /flushdns | Out-Null
+    }
+    return $alias
+}
+
+function Set-DashboardRdpCredential {
+    param(
+        [Parameter(Mandatory)][string]$Username,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Password,
+        [string]$AccountName
+    )
+
+    Assert-Administrator
+    if ([string]::IsNullOrWhiteSpace($AccountName)) { $AccountName = ".\$Username" }
+    $alias = Ensure-DashboardRdpAlias -Username $Username
+    $target = "TERMSRV/$alias"
+    & cmdkey.exe "/delete:$target" 2>$null | Out-Null
+    & cmdkey.exe "/generic:$target" "/user:$AccountName" "/pass:$Password" | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to store the RDP credential for '$Username' in Windows Credential Manager."
+    }
+}
+
+function Test-DashboardRdpCredential {
+    param([string]$Username)
+    if ([string]::IsNullOrWhiteSpace($Username)) { return $false }
+    $alias = Get-DashboardRdpAlias -Username $Username
+    $output = @(cmdkey.exe "/list:TERMSRV/$alias" 2>$null)
+    return (($output -join "`n") -match [regex]::Escape("TERMSRV/$alias"))
+}
+
 function New-DashboardUser {
     param([Parameter(Mandatory)][string]$Username, [string]$Password, [switch]$AllowBlankPasswordPolicyChange)
     Assert-Administrator
@@ -328,6 +701,7 @@ function New-DashboardUser {
         net user $Username $Password /add | Out-Null
     }
     net localgroup 'Remote Desktop Users' $Username /add | Out-Null
+    if (-not [string]::IsNullOrEmpty($Password)) { Set-DashboardRdpCredential -Username $Username -Password $Password -AccountName ".\$Username" }
 
     $userRoot = Join-Path $script:UsersRoot $Username
     New-DirectoryIfMissing -Path $userRoot
@@ -351,15 +725,19 @@ function Get-AllocatedPort {
     param([Parameter(Mandatory)][string]$Username, [switch]$Reserve)
     $state = Get-DashboardState
     if ($state.ContainsKey($Username) -and $state[$Username].SunshinePort) { return [int]$state[$Username].SunshinePort }
-    $used = @($state.Values | ForEach-Object { $_.SunshinePort })
+    $used = @($state.Values | ForEach-Object { if ($_.SunshinePort) { [int]$_.SunshinePort } })
     foreach ($port in $script:PortStart..$script:PortEnd) {
-        if ($used -notcontains $port -and -not (Test-NetConnection -ComputerName '127.0.0.1' -Port $port -InformationLevel Quiet -WarningAction SilentlyContinue)) {
-            if ($Reserve) {
-                $state[$Username] = @{ Username=$Username; SunshinePort=$port; SessionState='Stopped'; SunshineState='Stopped'; RdpSessionId=$null; RdpConnectionStatus='Disconnected' }
-                Save-DashboardState -State $state
-            }
-            return $port
+        if ($used -contains $port) { continue }
+        # Never probe 127.0.0.1 with Test-NetConnection. If a local process is
+        # already listening, Get-NetTCPConnection can identify the collision
+        # without opening a connection or waiting for a response.
+        $listener = Get-NetTCPConnection -LocalAddress '0.0.0.0','127.0.0.1','::','::1' -LocalPort $port -State Listen -ErrorAction SilentlyContinue
+        if ($null -ne $listener) { continue }
+        if ($Reserve) {
+            $state[$Username] = @{ Username=$Username; SunshinePort=$port; SessionState='Stopped'; SunshineState='Stopped'; RdpSessionId=$null; RdpConnectionStatus='Disconnected' }
+            Save-DashboardState -State $state
         }
+        return $port
     }
     throw 'No available Sunshine ports remain.'
 }
@@ -381,23 +759,70 @@ function Set-UserSunshineConfig {
 function Start-DashboardSession {
     param([Parameter(Mandatory)][string]$Username)
     Assert-Administrator
+    if (-not (Test-TsconAvailable)) { throw 'Windows tscon.exe is required but was not found.' }
+
+    # 1) Create a real 1920x1080 RDP login for the selected user using Remote Desktop Plus.
+    $rdpSession = Invoke-DashboardRdpPlusBootstrap -Username $Username
+
+    # 2) Hand the RDP session to the local console so the Windows session survives.
+    Invoke-TsconToConsole -SessionId $rdpSession.SessionId
+
+    # 3) Confirm the Windows session is still online after the handoff.
+    Start-Sleep -Milliseconds 750
+    $online = Get-UserSession -Username $Username
+    if ($null -eq $online -or -not $online.Online) {
+        throw "RDP session for '$Username' was handed off with tscon, but the user is not reported Active by Windows."
+    }
+
+    # 4) Start Sunshine only after the Windows user session is online.
     $port = Get-AllocatedPort -Username $Username -Reserve
     Set-UserSunshineConfig -Username $Username -Port $port
-    $aardwolf = Join-Path $script:InstallRoot 'Aardwolf\Aardwolf.exe'
-    if (Test-Path -LiteralPath $aardwolf) { Start-Process -FilePath $aardwolf -ArgumentList @('start','--user', $Username) }
     $sunshine = Join-Path (Join-Path 'C:\Users' $Username) 'AppData\Local\Muti Session Dashboard\Sunshine\Sunshine.exe'
     $conf = Join-Path (Join-Path 'C:\Users' $Username) 'AppData\Local\Muti Session Dashboard\Config\sunshine.conf'
-    Start-Process -FilePath $sunshine -ArgumentList @($conf) -LoadUserProfile
+    Start-Process -FilePath $sunshine -ArgumentList @($conf) -LoadUserProfile | Out-Null
+
     $state = Get-DashboardState
-    $state[$Username].SessionState = 'Running'; $state[$Username].SunshineState = 'Running'; $state[$Username].RdpConnectionStatus = 'Available'
+    $state[$Username].RdpSessionId = $online.SessionId
+    $state[$Username].RdpConnectionStatus = 'Online'
+    $state[$Username].SessionState = 'Running'
+    $state[$Username].SunshineState = 'Running'
     Save-DashboardState -State $state
+    return $online
 }
 
 function Connect-DashboardRdp {
     param([Parameter(Mandatory)][string]$Username)
+    Assert-Administrator
+    if (-not (Test-Path -LiteralPath $script:RdpPlusPath)) { throw "Remote Desktop Plus was not found at '$script:RdpPlusPath'." }
+
+    $before=@(Get-UserSessions -Username $Username)
+    $beforeIds=@($before | ForEach-Object { $_.SessionId })
+    $arguments=@('/v:127.0.0.2:3389',"/u:.\$Username","/p:$Username",'/w:1920','/h:1080')
+    Start-Process -FilePath $script:RdpPlusPath -ArgumentList $arguments | Out-Null
+
+    $rdp=Wait-DashboardRdpSession -Username $Username -TimeoutSeconds 30 -IgnoreSessionIds $beforeIds
+    if ($null -eq $rdp) { $rdp=Wait-DashboardRdpSession -Username $Username -TimeoutSeconds 5 }
+    if ($null -eq $rdp) { throw "Remote Desktop Plus did not produce an Active RDP session for '$Username'." }
+
+    $state=Get-DashboardState
+    if ($state.ContainsKey($Username)) {
+        $state[$Username].RdpSessionId=$rdp.SessionId
+        $state[$Username].RdpConnectionStatus='Connected'
+        Save-DashboardState -State $state
+    }
+    return $rdp
+}
+
+function Keep-Alive-DashboardRdp {
+    param([Parameter(Mandatory)][string]$Username)
+    $sessionId = Keep-DashboardRdpSessionAlive -Username $Username
     $state = Get-DashboardState
-    if (-not $state.ContainsKey($Username) -or $state[$Username].SessionState -eq 'Stopped') { throw 'Start the session before connecting RDP.' }
-    Start-Process -FilePath (Join-Path $script:InstallRoot 'Aardwolf\AardwolfGUI.exe') -ArgumentList @('connect','--user', $Username)
+    if ($state.ContainsKey($Username)) {
+        $state[$Username].RdpSessionId = $sessionId
+        $state[$Username].RdpConnectionStatus = 'Connected'
+        Save-DashboardState -State $state
+    }
+    return $sessionId
 }
 
 function Connect-DashboardMoonlight {
@@ -410,9 +835,13 @@ function Connect-DashboardMoonlight {
 function Stop-DashboardSession {
     param([Parameter(Mandatory)][string]$Username)
     Get-Process -Name 'Sunshine' -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "C:\Users\$Username\AppData\Local\Muti Session Dashboard\Sunshine\*" } | Stop-Process -Force
-    $aardwolf = Join-Path $script:InstallRoot 'Aardwolf\Aardwolf.exe'
-    if (Test-Path -LiteralPath $aardwolf) { Start-Process -FilePath $aardwolf -ArgumentList @('stop','--user', $Username) -Wait }
-    logoff $Username 2>$null
+
+    # Stop explicitly terminates the user's session; tscon is only used to
+    # detach an RDP session without logging it off.
+    $session = Get-UserRdpSessionId -Username $Username
+    if ($null -ne $session) { logoff $session.SessionId 2>$null }
+    else { logoff $Username 2>$null }
+
     $state = Get-DashboardState
     if ($state.ContainsKey($Username)) { $state[$Username].SunshinePort = $null; $state[$Username].SessionState='Stopped'; $state[$Username].SunshineState='Stopped'; $state[$Username].RdpConnectionStatus='Disconnected'; Save-DashboardState -State $state }
 }
@@ -424,11 +853,11 @@ function Test-DashboardInstallation {
         'Remote Desktop enabled' = (((Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -ErrorAction SilentlyContinue).fDenyTSConnections) -eq 0)
         'Moonlight downloaded' = (Test-Path -LiteralPath (Join-Path $script:InstallRoot 'Stream\Moonlight\Moonlight.exe'))
         'Sunshine downloaded' = (Test-Path -LiteralPath (Join-Path $script:InstallRoot 'Stream\Sunshine\Sunshine.exe'))
-        'Aardwolf installed' = (Test-Path -LiteralPath (Join-Path $script:InstallRoot 'Aardwolf\Aardwolf.exe'))
-        'Aardwolf GUI available' = (Test-Path -LiteralPath (Join-Path $script:InstallRoot 'Aardwolf\AardwolfGUI.exe'))
+        'tscon available' = (Test-TsconAvailable)
+        'Remote Desktop Plus available' = (Test-Path -LiteralPath $script:RdpPlusPath)
         'Dashboard installed' = (Test-Path -LiteralPath (Join-Path $script:InstallRoot 'Dashboard.ps1'))
     }
     $checks.GetEnumerator() | ForEach-Object { [pscustomobject]@{ Check=$_.Key; Passed=[bool]$_.Value } }
 }
 
-Export-ModuleMember -Function *-Dashboard*,Install-*,Test-*,New-DashboardUser,Start-DashboardSession,Stop-DashboardSession,Connect-DashboardRdp,Connect-DashboardMoonlight,Assert-Administrator,Set-DashboardPaths,Invoke-RdpWrapperInstaller
+Export-ModuleMember -Function *-Dashboard*,Install-*,Test-*,New-DashboardUser,Start-DashboardSession,Stop-DashboardSession,Connect-DashboardRdp,Keep-Alive-DashboardRdp,Connect-DashboardMoonlight,Assert-Administrator,Set-DashboardPaths,Invoke-RdpWrapperInstaller,Get-RdpEndpoint,Get-DashboardState,Get-RemoteDesktopUsers,Get-UserSession,Get-UserSessions,Get-UserRdpSessionId,Get-UserConsoleSession,Maintain-DashboardSession,Invoke-DashboardRdpPlusBootstrap,Set-DashboardRdpCredential,Test-DashboardRdpCredential

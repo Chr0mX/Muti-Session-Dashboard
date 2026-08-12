@@ -9,8 +9,6 @@ param(
     [string[]]$MoonlightAssetNamePatterns = @('^MoonlightPortable-x64\.zip$', '^MoonlightPortable-x64-.*\.zip$', '^MoonlightPortable.*x64.*\.zip$'),
     [string]$SunshineReleaseApiUri = 'https://api.github.com/repos/LizardByte/Sunshine/releases/latest',
     [string[]]$SunshineAssetNamePatterns = @('(?i)^sunshine-windows-portable\.zip$', '(?i)^sunshine-windows.*portable.*\.zip$', '(?i)^sunshine.*windows.*portable.*\.zip$', '(?i)^sunshine.*portable.*windows.*\.zip$'),
-    [Parameter(Mandatory=$false)][string]$AardwolfCliUri,
-    [Parameter(Mandatory=$false)][string]$AardwolfGuiUri,
     [switch]$RefreshDownloadCache
 )
 
@@ -29,7 +27,6 @@ $directories = @(
     $InstallRoot,
     (Join-Path $InstallRoot 'Stream\Moonlight'),
     (Join-Path $InstallRoot 'Stream\Sunshine'),
-    (Join-Path $InstallRoot 'Aardwolf'),
     (Join-Path $InstallRoot 'Config'),
     (Join-Path $InstallRoot 'Users')
 )
@@ -49,11 +46,8 @@ Install-MoonlightPortable -ReleaseApiUri $MoonlightReleaseApiUri -AssetNamePatte
 Write-Host 'Installing Sunshine Portable master copy...'
 Install-SunshinePortable -ReleaseApiUri $SunshineReleaseApiUri -AssetNamePatterns $SunshineAssetNamePatterns
 
-Write-Host 'Installing Aardwolf components...'
-if ([string]::IsNullOrWhiteSpace($AardwolfCliUri) -or [string]::IsNullOrWhiteSpace($AardwolfGuiUri)) {
-    throw 'Aardwolf CLI and GUI download URLs must be supplied with -AardwolfCliUri and -AardwolfGuiUri so the installer can verify exact required components.'
-}
-Install-AardwolfComponents -CliUri $AardwolfCliUri -GuiUri $AardwolfGuiUri
+Write-Host 'Using native Windows tscon/mstsc for RDP session management on 127.0.0.2:3389...'
+if (-not (Test-TsconAvailable)) { throw 'tscon.exe is required but was not found in System32.' }
 
 $checks = Test-DashboardInstallation
 $checks | Format-Table -AutoSize
