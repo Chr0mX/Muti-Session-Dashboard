@@ -21,7 +21,7 @@ RDP Wrapper is installed separately at `C:\Program Files\RDP Wrapper` using `htt
 
 ## Scripts
 
-- `scripts/Install-MultiSessionDashboard.ps1` downloads, silently installs, configures, and verifies RDP Wrapper from the release executable, Moonlight Portable, Sunshine Portable, Aardwolf CLI/GUI, and the dashboard.
+- `scripts/Install-MultiSessionDashboard.ps1` downloads, installs, configures, and verifies RDP Wrapper from the release executable, resolves the latest Moonlight Portable and Sunshine Portable archives through the GitHub releases API, installs Aardwolf CLI/GUI, and installs the dashboard.
 - `scripts/Dashboard.ps1` provides the operator dashboard with Create User, Start, Connect RDP, Connect Moonlight, Stop, and Refresh actions.
 - `scripts/MultiSessionDashboard.psm1` contains the reusable implementation for dependency verification, user creation, per-user Sunshine isolation, port allocation, Aardwolf integration, and Moonlight launching.
 
@@ -36,6 +36,8 @@ powershell.exe -ExecutionPolicy Bypass -File "C:\Program Files\Muti Session Dash
 ```
 
 RDP Wrapper is installed with the upstream-supported console argument `-install`. The upstream source treats `-offline` as a flag that disables update checks, so the dashboard installer no longer uses it by default because it can prevent the installer from fetching current wrapper metadata. To pass explicit installer arguments, use `-RdpWrapperInstallArguments`; to change the wait, use `-RdpWrapperInstallTimeoutSeconds`.
+
+Moonlight and Sunshine downloads are resolved from `https://api.github.com/repos/moonlight-stream/moonlight-qt/releases/latest` and `https://api.github.com/repos/LizardByte/Sunshine/releases/latest`, then matched against portable Windows ZIP asset name patterns before downloading.
 
 The installer caches dependency archives under `C:\Program Files\Muti Session Dashboard\Config\Downloads` and reuses them on later runs, so repeated installs do not re-download files unnecessarily. Use `-RefreshDownloadCache` to clear the cache before installing.
 

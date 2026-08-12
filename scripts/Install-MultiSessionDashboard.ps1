@@ -5,8 +5,10 @@ param(
     [string]$RdpWrapperUri = 'https://github.com/sergiye/rdpWrapper/releases/latest/download/rdpWrapper_x64.exe',
     [string[]]$RdpWrapperInstallArguments = @('-install'),
     [int]$RdpWrapperInstallTimeoutSeconds = 600,
-    [string]$MoonlightUri = 'https://github.com/moonlight-stream/moonlight-qt/releases/latest/download/MoonlightPortable-x64.zip',
-    [string]$SunshineUri = 'https://github.com/LizardByte/Sunshine/releases/latest/download/sunshine-windows-portable.zip',
+    [string]$MoonlightReleaseApiUri = 'https://api.github.com/repos/moonlight-stream/moonlight-qt/releases/latest',
+    [string[]]$MoonlightAssetNamePatterns = @('^MoonlightPortable-x64\.zip$', '^MoonlightPortable-x64-.*\.zip$', '^MoonlightPortable.*x64.*\.zip$'),
+    [string]$SunshineReleaseApiUri = 'https://api.github.com/repos/LizardByte/Sunshine/releases/latest',
+    [string[]]$SunshineAssetNamePatterns = @('(?i)^sunshine-windows-portable\.zip$', '(?i)^sunshine-windows.*portable.*\.zip$', '(?i)^sunshine.*windows.*portable.*\.zip$', '(?i)^sunshine.*portable.*windows.*\.zip$'),
     [Parameter(Mandatory=$false)][string]$AardwolfCliUri,
     [Parameter(Mandatory=$false)][string]$AardwolfGuiUri,
     [switch]$RefreshDownloadCache
@@ -42,10 +44,10 @@ Write-Host 'Installing RDP Wrapper...'
 Install-RdpWrapper -Source $RdpWrapperUri -InstallArguments $RdpWrapperInstallArguments -InstallTimeoutSeconds $RdpWrapperInstallTimeoutSeconds
 
 Write-Host 'Installing Moonlight Portable...'
-Install-MoonlightPortable -Uri $MoonlightUri
+Install-MoonlightPortable -ReleaseApiUri $MoonlightReleaseApiUri -AssetNamePatterns $MoonlightAssetNamePatterns
 
 Write-Host 'Installing Sunshine Portable master copy...'
-Install-SunshinePortable -Uri $SunshineUri
+Install-SunshinePortable -ReleaseApiUri $SunshineReleaseApiUri -AssetNamePatterns $SunshineAssetNamePatterns
 
 Write-Host 'Installing Aardwolf components...'
 if ([string]::IsNullOrWhiteSpace($AardwolfCliUri) -or [string]::IsNullOrWhiteSpace($AardwolfGuiUri)) {

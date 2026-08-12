@@ -207,6 +207,35 @@ function Test-RdpWrapperConfiguration {
     [pscustomobject]@{ Success = $failures.Count -eq 0; Failures = $failures }
 }
 
+
+function Resolve-GitHubLatestReleaseAsset {
+    param(
+        [Parameter(Mandatory)][string]$ReleaseApiUri,
+        [Parameter(Mandatory)][string[]]$AssetNamePatterns,
+        [Parameter(Mandatory)][string]$ComponentName
+    )
+
+    Write-Host "Querying latest $ComponentName release: $ReleaseApiUri"
+    $release = Invoke-RestMethod -Uri $ReleaseApiUri -UseBasicParsing -Headers @{ 'User-Agent' = 'Muti-Session-Dashboard-Installer' }
+    if (-not $release.assets) { throw "No assets were returned by $ReleaseApiUri for $ComponentName." }
+
+    foreach ($pattern in $AssetNamePatterns) {
+        $asset = @($release.assets | Where-Object { $_.name -match $pattern } | Sort-Object -Property name | Select-Object -First 1)
+        if ($asset.Count -gt 0) {
+            $selected = $asset[0]
+            Write-Host "Selected $ComponentName asset '$($selected.name)' from release '$($release.tag_name)'."
+            return [pscustomobject]@{
+                Name = $selected.name
+                Uri = $selected.browser_download_url
+                Release = $release.tag_name
+            }
+        }
+    }
+
+    $available = ($release.assets | ForEach-Object { $_.name }) -join ', '
+    throw "Could not find a $ComponentName release asset matching patterns: $($AssetNamePatterns -join ', '). Available assets: $available"
+}
+
 function Install-PortableZip {
     param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][string]$Uri, [Parameter(Mandatory)][string]$Destination)
     $zip = Join-Path $env:TEMP "$Name.zip"
@@ -215,14 +244,22 @@ function Install-PortableZip {
 }
 
 function Install-MoonlightPortable {
-    param([string]$Uri = 'https://github.com/moonlight-stream/moonlight-qt/releases/latest/download/MoonlightPortable-x64.zip')
-    Install-PortableZip -Name 'moonlight' -Uri $Uri -Destination (Join-Path $script:InstallRoot 'Stream\Moonlight')
+    param(
+        [string]$ReleaseApiUri = 'https://api.github.com/repos/moonlight-stream/moonlight-qt/releases/latest',
+        [string[]]$AssetNamePatterns = @('^MoonlightPortable-x64\.zip$', '^MoonlightPortable-x64-.*\.zip$', '^MoonlightPortable.*x64.*\.zip$')
+    )
+    $asset = Resolve-GitHubLatestReleaseAsset -ReleaseApiUri $ReleaseApiUri -AssetNamePatterns $AssetNamePatterns -ComponentName 'Moonlight Portable'
+    Install-PortableZip -Name 'moonlight' -Uri $asset.Uri -Destination (Join-Path $script:InstallRoot 'Stream\Moonlight')
     if (-not (Test-Path -LiteralPath (Join-Path $script:InstallRoot 'Stream\Moonlight\Moonlight.exe'))) { throw 'Moonlight.exe was not found after extraction.' }
 }
 
 function Install-SunshinePortable {
-    param([string]$Uri = 'https://github.com/LizardByte/Sunshine/releases/latest/download/sunshine-windows-portable.zip')
-    Install-PortableZip -Name 'sunshine' -Uri $Uri -Destination (Join-Path $script:InstallRoot 'Stream\Sunshine')
+    param(
+        [string]$ReleaseApiUri = 'https://api.github.com/repos/LizardByte/Sunshine/releases/latest',
+        [string[]]$AssetNamePatterns = @('(?i)^sunshine-windows-portable\.zip$', '(?i)^sunshine-windows.*portable.*\.zip$', '(?i)^sunshine.*windows.*portable.*\.zip$', '(?i)^sunshine.*portable.*windows.*\.zip$')
+    )
+    $asset = Resolve-GitHubLatestReleaseAsset -ReleaseApiUri $ReleaseApiUri -AssetNamePatterns $AssetNamePatterns -ComponentName 'Sunshine Portable'
+    Install-PortableZip -Name 'sunshine' -Uri $asset.Uri -Destination (Join-Path $script:InstallRoot 'Stream\Sunshine')
     if (-not (Test-Path -LiteralPath (Join-Path $script:InstallRoot 'Stream\Sunshine\Sunshine.exe'))) { throw 'Sunshine.exe was not found after extraction.' }
 }
 
