@@ -3,8 +3,8 @@
 param(
     [string]$InstallRoot = 'C:\Program Files\Muti Session Dashboard',
     [string]$RdpWrapperUri = 'https://github.com/sergiye/rdpWrapper/releases/latest/download/rdpWrapper_x64.exe',
-    [string[]]$RdpWrapperSilentInstallArguments = @('/S'),
-    [int]$RdpWrapperInstallTimeoutSeconds = 300,
+    [string[]]$RdpWrapperInstallArguments = @(),
+    [int]$RdpWrapperInstallTimeoutSeconds = 0,
     [string]$MoonlightUri = 'https://github.com/moonlight-stream/moonlight-qt/releases/latest/download/MoonlightPortable-x64.zip',
     [string]$SunshineUri = 'https://github.com/LizardByte/Sunshine/releases/latest/download/sunshine-windows-portable.zip',
     [Parameter(Mandatory=$false)][string]$AardwolfCliUri,
@@ -39,7 +39,7 @@ Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Dashboard.ps1') -Destination (J
 Copy-Item -LiteralPath $modulePath -Destination (Join-Path $InstallRoot 'MultiSessionDashboard.psm1') -Force
 
 Write-Host 'Installing RDP Wrapper...'
-Install-RdpWrapper -Source $RdpWrapperUri -SilentInstallArguments $RdpWrapperSilentInstallArguments -InstallTimeoutSeconds $RdpWrapperInstallTimeoutSeconds
+Install-RdpWrapper -Source $RdpWrapperUri -InstallArguments $RdpWrapperInstallArguments -InstallTimeoutSeconds $RdpWrapperInstallTimeoutSeconds
 
 Write-Host 'Installing Moonlight Portable...'
 Install-MoonlightPortable -Uri $MoonlightUri

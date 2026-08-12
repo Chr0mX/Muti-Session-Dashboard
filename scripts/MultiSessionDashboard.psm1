@@ -97,11 +97,43 @@ function Expand-ArchiveSafe {
     Expand-Archive -Path $Archive -DestinationPath $Destination -Force
 }
 
+
+function Invoke-RdpWrapperInstaller {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [Parameter(Mandatory)][string]$WorkingDirectory,
+        [string[]]$ArgumentList = @(),
+        [int]$TimeoutSeconds = 0
+    )
+
+    $startParameters = @{
+        FilePath = $FilePath
+        WorkingDirectory = $WorkingDirectory
+        PassThru = $true
+        Wait = ($TimeoutSeconds -le 0)
+    }
+    if ($ArgumentList.Count -gt 0) { $startParameters.ArgumentList = $ArgumentList }
+
+    Write-Host "Starting RDP Wrapper installer: $FilePath"
+    if ($ArgumentList.Count -gt 0) { Write-Host "RDP Wrapper installer arguments: $($ArgumentList -join ' ')" }
+    else { Write-Host 'RDP Wrapper installer arguments: <none; interactive/default installer mode>' }
+
+    $process = Start-Process @startParameters
+    if ($TimeoutSeconds -gt 0 -and -not $process.WaitForExit($TimeoutSeconds * 1000)) {
+        $process.Kill()
+        throw "RDP Wrapper installer did not finish within $TimeoutSeconds seconds. Re-run with -RdpWrapperInstallTimeoutSeconds 0 for interactive/default installer mode, or pass installer-specific arguments with -RdpWrapperInstallArguments."
+    }
+
+    if ($process.ExitCode -ne 0) {
+        throw "RDP Wrapper installer exited with code $($process.ExitCode). Re-run with -RdpWrapperInstallArguments @() for default interactive mode or provide arguments supported by this installer release."
+    }
+}
+
 function Install-RdpWrapper {
     param(
         [string]$Source = 'https://github.com/sergiye/rdpWrapper/releases/latest/download/rdpWrapper_x64.exe',
-        [string[]]$SilentInstallArguments = @('/S'),
-        [int]$InstallTimeoutSeconds = 300
+        [string[]]$InstallArguments = @(),
+        [int]$InstallTimeoutSeconds = 0
     )
     New-DirectoryIfMissing -Path $script:RdpWrapperRoot
     $extension = [IO.Path]::GetExtension(([Uri]$Source).AbsolutePath)
@@ -113,22 +145,12 @@ function Install-RdpWrapper {
         Expand-ArchiveSafe -Archive $package -Destination $script:RdpWrapperRoot
         $install = Get-ChildItem -LiteralPath $script:RdpWrapperRoot -Recurse -Filter 'install.bat' -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($install) {
-            $process = Start-Process -FilePath $install.FullName -WorkingDirectory $install.DirectoryName -ArgumentList $SilentInstallArguments -PassThru
-            if (-not $process.WaitForExit($InstallTimeoutSeconds * 1000)) {
-                $process.Kill()
-                throw "RDP Wrapper batch installer did not finish within $InstallTimeoutSeconds seconds."
-            }
-            if ($process.ExitCode -ne 0) { throw "RDP Wrapper batch installer exited with code $($process.ExitCode)." }
+            Invoke-RdpWrapperInstaller -FilePath $install.FullName -WorkingDirectory $install.DirectoryName -ArgumentList $InstallArguments -TimeoutSeconds $InstallTimeoutSeconds
         }
     } elseif ($extension -ieq '.exe') {
         $installer = Join-Path $script:RdpWrapperRoot 'rdpWrapper_x64.exe'
         Copy-Item -LiteralPath $package -Destination $installer -Force
-        $process = Start-Process -FilePath $installer -WorkingDirectory $script:RdpWrapperRoot -ArgumentList $SilentInstallArguments -PassThru
-        if (-not $process.WaitForExit($InstallTimeoutSeconds * 1000)) {
-            $process.Kill()
-            throw "RDP Wrapper installer did not finish within $InstallTimeoutSeconds seconds. Check the silent arguments or run with -RdpWrapperSilentInstallArguments set for this release."
-        }
-        if ($process.ExitCode -ne 0) { throw "RDP Wrapper installer exited with code $($process.ExitCode)." }
+        Invoke-RdpWrapperInstaller -FilePath $installer -WorkingDirectory $script:RdpWrapperRoot -ArgumentList $InstallArguments -TimeoutSeconds $InstallTimeoutSeconds
     } else {
         throw "Unsupported RDP Wrapper package type '$extension' from $Source"
     }
@@ -355,4 +377,4 @@ function Test-DashboardInstallation {
     $checks.GetEnumerator() | ForEach-Object { [pscustomobject]@{ Check=$_.Key; Passed=[bool]$_.Value } }
 }
 
-Export-ModuleMember -Function *-Dashboard*,Install-*,Test-*,New-DashboardUser,Start-DashboardSession,Stop-DashboardSession,Connect-DashboardRdp,Connect-DashboardMoonlight,Assert-Administrator,Set-DashboardPaths
+Export-ModuleMember -Function *-Dashboard*,Install-*,Test-*,New-DashboardUser,Start-DashboardSession,Stop-DashboardSession,Connect-DashboardRdp,Connect-DashboardMoonlight,Assert-Administrator,Set-DashboardPaths,Invoke-RdpWrapperInstaller
