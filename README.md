@@ -17,11 +17,11 @@ C:\Program Files\Muti Session Dashboard\
 └── Users\
 ```
 
-RDP Wrapper is installed separately at `C:\Program Files\RDP Wrapper`.
+RDP Wrapper is installed separately at `C:\Program Files\RDP Wrapper` using `https://github.com/sergiye/rdpWrapper/releases/latest/download/rdpWrapper_x64.exe`.
 
 ## Scripts
 
-- `scripts/Install-MultiSessionDashboard.ps1` downloads, installs, configures, and verifies RDP Wrapper, Moonlight Portable, Sunshine Portable, Aardwolf CLI/GUI, and the dashboard.
+- `scripts/Install-MultiSessionDashboard.ps1` downloads, installs, configures, and verifies RDP Wrapper from the release executable, Moonlight Portable, Sunshine Portable, Aardwolf CLI/GUI, and the dashboard.
 - `scripts/Dashboard.ps1` provides the operator dashboard with Create User, Start, Connect RDP, Connect Moonlight, Stop, and Refresh actions.
 - `scripts/MultiSessionDashboard.psm1` contains the reusable implementation for dependency verification, user creation, per-user Sunshine isolation, port allocation, Aardwolf integration, and Moonlight launching.
 

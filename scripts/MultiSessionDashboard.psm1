@@ -98,13 +98,24 @@ function Expand-ArchiveSafe {
 }
 
 function Install-RdpWrapper {
-    param([string]$Source = 'https://github.com/sergiye/rdpWrapper/archive/refs/heads/master.zip')
-    $zip = Join-Path $env:TEMP 'rdpWrapper.zip'
-    Invoke-DownloadFile -Uri $Source -Destination $zip -CacheName 'rdpWrapper'
-    Expand-ArchiveSafe -Archive $zip -Destination $script:RdpWrapperRoot
+    param([string]$Source = 'https://github.com/sergiye/rdpWrapper/releases/latest/download/rdpWrapper_x64.exe')
+    New-DirectoryIfMissing -Path $script:RdpWrapperRoot
+    $extension = [IO.Path]::GetExtension(([Uri]$Source).AbsolutePath)
+    if ([string]::IsNullOrWhiteSpace($extension)) { $extension = '.download' }
+    $package = Join-Path $env:TEMP "rdpWrapper$extension"
+    Invoke-DownloadFile -Uri $Source -Destination $package -CacheName 'rdpWrapper'
 
-    $install = Get-ChildItem -LiteralPath $script:RdpWrapperRoot -Recurse -Filter 'install.bat' -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($install) { Start-Process -FilePath $install.FullName -WorkingDirectory $install.DirectoryName -Wait -Verb RunAs }
+    if ($extension -ieq '.zip') {
+        Expand-ArchiveSafe -Archive $package -Destination $script:RdpWrapperRoot
+        $install = Get-ChildItem -LiteralPath $script:RdpWrapperRoot -Recurse -Filter 'install.bat' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($install) { Start-Process -FilePath $install.FullName -WorkingDirectory $install.DirectoryName -Wait -Verb RunAs }
+    } elseif ($extension -ieq '.exe') {
+        $installer = Join-Path $script:RdpWrapperRoot 'rdpWrapper_x64.exe'
+        Copy-Item -LiteralPath $package -Destination $installer -Force
+        Start-Process -FilePath $installer -WorkingDirectory $script:RdpWrapperRoot -Wait -Verb RunAs
+    } else {
+        throw "Unsupported RDP Wrapper package type '$extension' from $Source"
+    }
 
     Set-RdpWrapperConfiguration
     $result = Test-RdpWrapperConfiguration
