@@ -211,26 +211,24 @@ function global:Invoke-DashboardRdpBootstrap {
     # that have no dedicated rdp.exe CLI flag; /u: and /p: are still passed
     # on the command line since a plaintext password can't be stored in the
     # .rdp file itself.
-    # /batch is RDP+'s own documented "script mode" flag: it prevents RDP+
-    # from showing its own error messages/prompts, which is what was
-    # popping up instead of an instant, silent connect -- confirmed against
-    # RDP+'s actual documented command-line syntax (donkz.nl), not assumed.
-    # /log likewise comes from that same documented syntax: it makes RDP+
-    # write its own connection diagnostics to a file, which is surfaced
-    # below on a timeout instead of guessing again at why the session never
-    # came up Active -- a real symptom seen once already is the session
-    # landing in Disconnected with no session name at all, meaning rdp.exe
-    # itself never completed the connection; RDP+'s own log is the only
-    # place that can say why.
+    #
+    # /batch and /log were added here at one point on the belief that they
+    # were RDP+'s own documented flags. They were not: that "documentation"
+    # came from a fetch against RDP+'s installer .msi binary, which the
+    # fetch tool itself said had no readable docs -- yet it returned a
+    # suspiciously complete-looking syntax reference anyway, a hallucination
+    # this project trusted for too long. A real web search plus fetching
+    # donkz.nl's actual settings/companion-tools pages directly turned up no
+    # mention of /batch or /log anywhere. Passing unrecognized switches is
+    # the likely reason RDP+ went from "connects but shows its own window"
+    # to "never completes the connection at all" (the session landing in
+    # Disconnected with no session name -- rdp.exe never got that far).
+    # Removed both; back to the minimal, verifiable command line.
     $rdpFile = New-DashboardRdpFile -Username $Username
-    $logFile = Join-Path (Get-DashboardConfigRoot) "Logs\$Username-rdp-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
-    New-DirectoryIfMissing -Path (Split-Path -Parent $logFile)
     $arguments = @(
         "`"$rdpFile`"",
         "/u:.\$Username",
-        "/p:$Username",
-        '/batch',
-        "/log:`"$logFile`""
+        "/p:$Username"
     )
 
     Write-Host "Starting Remote Desktop Plus for '$Username' at 1920x1080."
@@ -260,6 +258,10 @@ function global:Invoke-DashboardRdpBootstrap {
         }
         $fallbackNote = if ($sourceInfo.FallbackReason) { " (fell back because: $($sourceInfo.FallbackReason))" } else { '' }
 
+        # Still real, verifiable diagnostic info: whether rdp.exe is even
+        # still alive, and its exit code if not, gathered directly from the
+        # process object -- unlike the removed /log flag, this needs no
+        # unverified RDP+-specific switch.
         $processNote = try {
             $proc = Get-Process -Id $process.Id -ErrorAction Stop
             "rdp.exe (PID $($process.Id)) is still running."
@@ -267,15 +269,7 @@ function global:Invoke-DashboardRdpBootstrap {
             "rdp.exe (PID $($process.Id)) has already exited (exit code $($process.ExitCode))."
         }
 
-        $logNote = if (Test-Path -LiteralPath $logFile) {
-            $logContent = (Get-Content -LiteralPath $logFile -Raw -ErrorAction SilentlyContinue)
-            if ([string]::IsNullOrWhiteSpace($logContent)) { "RDP+ log at '$logFile' exists but is empty." }
-            else { "RDP+ log ('$logFile'):`n$logContent" }
-        } else {
-            "RDP+ did not create a log file at '$logFile'."
-        }
-
-        throw "RDP login for '$Username' did not produce an active RDP session within 45 seconds. $processNote Detection source: $($sourceInfo.Source)$fallbackNote. Sessions observed for '$Username': $dump. $logNote Run 'query session' to compare against what Windows itself reports."
+        throw "RDP login for '$Username' did not produce an active RDP session within 45 seconds. $processNote Detection source: $($sourceInfo.Source)$fallbackNote. Sessions observed for '$Username': $dump. Run 'query session' to compare against what Windows itself reports."
     }
 
     if ($Minimize) { Set-DashboardWindowMinimized -ProcessId $process.Id }
