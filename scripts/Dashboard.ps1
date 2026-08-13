@@ -46,11 +46,11 @@ $grid.ReadOnly = $true
 $grid.RowHeadersVisible = $false
 
 foreach ($column in @(
-    @{ Name='Username'; Header='Username'; Width=180 },
-    @{ Name='RdpHostPort'; Header='RDP Endpoint'; Width=150 },
+    @{ Name='Username'; Header='Username'; Width=160 },
+    @{ Name='RdpHostPort'; Header='RDP Endpoint'; Width=140 },
     @{ Name='RdpSessionId'; Header='RDP Session'; Width=90 },
-    @{ Name='SessionState'; Header='Session'; Width=100 },
-    @{ Name='RdpConnectionStatus'; Header='RDP Status'; Width=130 }
+    @{ Name='SessionState'; Header='Session'; Width=90 },
+    @{ Name='RdpConnectionStatus'; Header='RDP Status'; Width=120 }
 )) {
     $columnObject = New-Object Windows.Forms.DataGridViewTextBoxColumn
     $columnObject.Name = $column.Name
@@ -148,18 +148,25 @@ function Update-SessionMonitor {
                 $state[$key] = Get-DefaultDashboardStateEntry -Username $key -AccountName $user.AccountName
             }
             $entry = $state[$key]
+            $wasInteractive = ($entry.SessionState -eq 'Running')
 
             try {
                 $session = Get-UserSession -Username $key
                 if ($null -eq $session) {
                     $entry.RdpSessionId = $null
                     $entry.RdpConnectionStatus = 'Disconnected'
-                    if ($entry.SessionState -eq 'Running') { $entry.SessionState = 'Stopped' }
+                    if ($entry.SessionState -ne 'Stopped') { $entry.SessionState = 'Stopped' }
                 } else {
                     $entry.RdpSessionId = $session.SessionId
                     if ($session.Online) {
-                        $entry.RdpConnectionStatus = 'Connected'
-                        $entry.SessionState = 'Running'
+                        # A headless-armed entry whose session shows Online
+                        # again with no interactive Connect having happened
+                        # is just the loopback itself reconnecting; treat it
+                        # as still armed rather than clobbering that state.
+                        if (-not $entry.HeadlessArmed) {
+                            $entry.RdpConnectionStatus = 'Connected'
+                            $entry.SessionState = 'Running'
+                        }
                     } else {
                         $entry.RdpConnectionStatus = 'Disconnected'
                     }
@@ -168,6 +175,24 @@ function Update-SessionMonitor {
                 # Keep the dashboard alive even if a single user's session
                 # temporarily cannot be queried.
                 $entry.RdpConnectionStatus = 'Error'
+            }
+
+            # Headless RDP Loopback re-arm: once the interactive client that
+            # displaced a headless connection disconnects (session goes
+            # fully offline), automatically start a fresh headless loopback
+            # so the user is HEADLESS READY again for the next Connect,
+            # exactly as the flow requires -- no operator action needed.
+            $justWentOffline = ($wasInteractive -and $entry.SessionState -eq 'Stopped' -and -not $entry.HeadlessArmed -and -not $entry.StopRequested)
+            if ($justWentOffline) {
+                $script:DashboardActionInProgress = $true
+                try {
+                    Start-DashboardHeadlessLoopback -Username $key | Out-Null
+                    $entry = $state[$key]
+                } catch {
+                    Write-Verbose "Auto re-arm of headless loopback for '$key' failed: $($_.Exception.Message)"
+                } finally {
+                    $script:DashboardActionInProgress = $false
+                }
             }
         }
         Save-DashboardState -State $state
@@ -193,7 +218,7 @@ function Invoke-DashboardAction([scriptblock]$Action, [string]$Success) {
     # click - CAN be processed while $Action is still running, so disable
     # every action button here to make that reentrant click a no-op instead
     # of a second action racing the first.
-    $actionButtons = @($create, $rdp, $stop, $refresh)
+    $actionButtons = @($create, $start, $rdp, $stop, $refresh, $openWrapper)
     foreach ($button in $actionButtons) { $button.Enabled = $false }
     $script:DashboardActionInProgress = $true
     $form.Refresh()
@@ -239,13 +264,31 @@ $form.Controls.Add($create)
 
 
 
+$start = New-Object Windows.Forms.Button
+
+$start.Text = 'Start'
+
+$start.Location = New-Object Drawing.Point(155, 370)
+
+$start.Size = New-Object Drawing.Size(100, 36)
+
+# Headless RDP Loopback: arms a background/anchor RDP connection so the
+# user's session comes up and stays "HEADLESS READY" without an RDP window
+# ever appearing. Connect below reconnects the same session interactively,
+# which displaces this automatically -- standard RDP behavior.
+$start.Add_Click({ Invoke-DashboardAction { Start-DashboardHeadlessLoopback -Username (Get-SelectedUsername) } 'Headless loopback armed' })
+
+$form.Controls.Add($start)
+
+
+
 $rdp = New-Object Windows.Forms.Button
 
 $rdp.Text = 'Connect RDP'
 
-$rdp.Location = New-Object Drawing.Point(155, 370)
+$rdp.Location = New-Object Drawing.Point(263, 370)
 
-$rdp.Size = New-Object Drawing.Size(130, 36)
+$rdp.Size = New-Object Drawing.Size(120, 36)
 
 $rdp.Add_Click({ Invoke-DashboardAction { Connect-DashboardRdp -Username (Get-SelectedUsername) } 'RDP connected' })
 
@@ -257,9 +300,9 @@ $stop = New-Object Windows.Forms.Button
 
 $stop.Text = 'Stop'
 
-$stop.Location = New-Object Drawing.Point(298, 370)
+$stop.Location = New-Object Drawing.Point(391, 370)
 
-$stop.Size = New-Object Drawing.Size(110, 36)
+$stop.Size = New-Object Drawing.Size(90, 36)
 
 $stop.Add_Click({ Invoke-DashboardAction { Stop-DashboardSession -Username (Get-SelectedUsername) } 'Session stopped' })
 
@@ -271,13 +314,27 @@ $refresh = New-Object Windows.Forms.Button
 
 $refresh.Text = 'Refresh'
 
-$refresh.Location = New-Object Drawing.Point(421, 370)
+$refresh.Location = New-Object Drawing.Point(489, 370)
 
-$refresh.Size = New-Object Drawing.Size(110, 36)
+$refresh.Size = New-Object Drawing.Size(90, 36)
 
 $refresh.Add_Click({ Refresh-Grid; Set-Status 'Refreshed' })
 
 $form.Controls.Add($refresh)
+
+
+
+$openWrapper = New-Object Windows.Forms.Button
+
+$openWrapper.Text = 'Open RDP Wrapper'
+
+$openWrapper.Location = New-Object Drawing.Point(587, 370)
+
+$openWrapper.Size = New-Object Drawing.Size(160, 36)
+
+$openWrapper.Add_Click({ Invoke-DashboardAction { Open-DashboardRdpWrapperManager } 'RDP Wrapper manager opened' })
+
+$form.Controls.Add($openWrapper)
 
 
 

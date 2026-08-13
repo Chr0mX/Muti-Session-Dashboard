@@ -35,11 +35,51 @@ RDP Wrapper is installed separately at `C:\Program Files\RDP Wrapper`, resolved 
 
 - `install.ps1` is the URL-based entry point (`irm ... | iex`). It stages the scripts below from raw GitHub and runs the installer, so it doubles as the update command.
 - `scripts/Install-MultiSessionDashboard.ps1` downloads, installs, configures, and verifies RDP Wrapper and Remote Desktop Plus, and installs the dashboard.
-- `scripts/Dashboard.ps1` provides the operator dashboard with Create User, Connect RDP, Stop, and Refresh actions.
-  - **Connect RDP** launches [Remote Desktop Plus](https://www.donkz.nl/) (`rdp.exe`) against `127.0.0.2:3389` with the account's username passed as both `/u:` and `/p:`, so the login is fully automatic — no saved-credential prompt to click through. Dashboard-created accounts always get the username as their Windows password so this always succeeds. Connecting for a user who already has a disconnected session reconnects it — standard RDP behavior — so there's no separate "Start" step; one button covers both the first connect and any later reconnect.
-  - **Stop** signs the selected user off.
-  - A background monitor polls every Remote Desktop Users member's real session state every 2 seconds, so the dashboard reflects RDP connections made outside the dashboard too (e.g. a manual `rdp.exe`/mstsc connection) — a pure status reflection of live Windows state, never a stored flag alone.
-- `scripts/MultiSessionDashboard.psm1` contains the reusable implementation: dependency install/verification, user creation, session detection, and the automated RDP connect flow.
+- `scripts/Dashboard.ps1` provides the operator dashboard with Create User, Start, Connect RDP, Stop, Refresh, and Open RDP Wrapper actions.
+  - Both **Start** and **Connect RDP** launch [Remote Desktop Plus](https://www.donkz.nl/) (`rdp.exe`) against `127.0.0.2:3389` with the account's username passed as both `/u:` and `/p:` (plus a generated `.rdp` file carrying settings like `smart sizing:i:1` that have no dedicated CLI flag), so the login is fully automatic — no saved-credential prompt to click through. Dashboard-created accounts always get the username as their Windows password so this always succeeds.
+  - **Start** arms a **headless RDP loopback**: the same automated login, launched minimized so no RDP window appears. This keeps the user's session alive and "ready" without anyone looking at it. See [Headless RDP Loopback](#headless-rdp-loopback) below.
+  - **Connect RDP** launches a real, visible, interactive client. Reconnecting to a session that already exists — whether disconnected or headless-armed — takes it over: standard RDP behavior, where a new client connecting to an existing session disconnects whichever client held it before. So Connect RDP alone (without ever pressing Start first) still works exactly like a normal connect/reconnect.
+  - **Stop** signs the selected user off and tears down any armed headless loopback for them.
+  - **Open RDP Wrapper** launches the RDP Wrapper manager UI (`C:\Program Files\RDP Wrapper\rdpWrapper_x64.exe`) directly, for manual inspection/reconfiguration.
+  - A background monitor polls every Remote Desktop Users member's real session state every 2 seconds, so the dashboard reflects RDP connections made outside the dashboard too (e.g. a manual `rdp.exe`/mstsc connection) — a pure status reflection of live Windows state, never a stored flag alone. It also automatically re-arms the headless loopback once an interactive session goes offline (unless the operator explicitly hit Stop), so a user is back to "ready" for the next Connect with no manual Start needed.
+- `scripts/MultiSessionDashboard.psm1` contains the reusable implementation: dependency install/verification, user creation, session detection (via the WTS API, not text-parsed `quser`), and the automated RDP connect/headless-loopback flow.
+- `scripts/BetterRDP/` contains [Upinel/BetterRDP](https://github.com/Upinel/BetterRDP)'s host-side RDP performance tweaks (`UpinelBetterRDP.reg`, `BetterRDP.ps1`), applied manually and separately from the dashboard install. The `.ps1` copy here is modified to detect the RDP server's current primary monitor refresh rate and match the frame-rate-related registry values to it, instead of the upstream script's fixed ~60Hz assumption.
+
+## Headless RDP Loopback
+
+```text
+                         DASHBOARD
+                             │
+             ┌───────────────┼────────────────┐
+             │               │                │
+           START           CONNECT           STOP
+             │               │                │
+             ▼               ▼                ▼
+      Arm Headless      Launch Interactive   Stop Headless
+      Loopback RDP      RDP Connection       Loopback RDP
+             │               │                │
+             ▼               ▼                ▼
+      HEADLESS READY    Headless loopback    Sign off
+                              displaced       User Session
+                                 │                │
+                                 ▼                ▼
+                           USER CONNECTED       STOPPED
+                                 │
+                          User closes RDP
+                                 │
+                                 ▼
+                         Wait for RDP session
+                              to close
+                                 │
+                                 ▼
+                         Start Headless
+                         Loopback RDP
+                                 │
+                                 ▼
+                          HEADLESS READY
+```
+
+A headless loopback connection is just an ordinary automated RDP login (same as Connect RDP) that gets minimized right after it comes up, so it never shows a window. Its only purpose is to keep the account's session alive and immediately reconnect-able. Nothing about it is special at the RDP protocol level — the "displacement" when Connect RDP is used afterward is just RDP's normal single-active-client-per-session behavior.
 
 ## Quick start
 

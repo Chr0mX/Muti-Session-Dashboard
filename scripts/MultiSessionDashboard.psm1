@@ -6,12 +6,15 @@ $script:ConfigRoot = Join-Path $script:InstallRoot 'Config'
 $script:UsersRoot = Join-Path $script:InstallRoot 'Users'
 $script:StateFile = Join-Path $script:ConfigRoot 'sessions.json'
 $script:DownloadCacheRoot = Join-Path $script:ConfigRoot 'Downloads'
+$script:RdpFileCacheRoot = Join-Path $script:ConfigRoot 'RdpFiles'
 # RDP Wrapper's concurrent multi-session support is more reliable connecting
 # through a distinct loopback address than through 127.0.0.1 -- this is kept
 # regardless of whether a session ever touches the console.
 $script:RdpHost = '127.0.0.2'
 $script:RdpPort = 3389
 $script:RdpPlusPath = 'C:\Program Files (x86)\Remote Desktop Plus\rdp.exe'
+$script:RdpWrapperManagerPath = 'C:\Program Files\RDP Wrapper\rdpWrapper_x64.exe'
+$script:RdpFileCacheRoot = $null
 
 
 function Set-DashboardPaths {
@@ -21,6 +24,7 @@ function Set-DashboardPaths {
     $script:UsersRoot = Join-Path $script:InstallRoot 'Users'
     $script:StateFile = Join-Path $script:ConfigRoot 'sessions.json'
     $script:DownloadCacheRoot = Join-Path $script:ConfigRoot 'Downloads'
+    $script:RdpFileCacheRoot = Join-Path $script:ConfigRoot 'RdpFiles'
 }
 
 function Assert-Administrator {
@@ -446,19 +450,125 @@ function Get-RdpEndpoint {
     return "$($script:RdpHost):$($script:RdpPort)"
 }
 
-function Get-UserSessions {
-    param([Parameter(Mandatory)][string]$Username)
-    $sessions = @()
+function Add-DashboardWtsApiType {
+    <#
+        Registers the Win32 WTS (Windows Terminal Services) session
+        enumeration API via P/Invoke. Get-AllUserSessions prefers this over
+        parsing quser's fixed-width text output: quser has been observed to
+        report a session that is genuinely Active (confirmed independently
+        via `query session`) as not found at all when its column layout
+        doesn't match the parsing regex exactly for that Windows build, or
+        when it is invoked without a real attached console (as happens when
+        PowerShell is launched non-interactively, e.g. from a GUI process).
+        WTSEnumerateSessions/WTSQuerySessionInformation is the same API
+        `quser`/`query session` themselves call internally, without the text
+        round-trip that makes parsing fragile.
+    #>
+    if ('BetterRdp.Wts' -as [type]) { return }
+    Add-Type -Namespace BetterRdp -Name Wts -MemberDefinition @'
+[DllImport("wtsapi32.dll", SetLastError = true)]
+public static extern IntPtr WTSOpenServer(string pServerName);
+
+[DllImport("wtsapi32.dll")]
+public static extern void WTSCloseServer(IntPtr hServer);
+
+[DllImport("wtsapi32.dll", SetLastError = true)]
+public static extern bool WTSEnumerateSessions(IntPtr hServer, int Reserved, int Version, out IntPtr ppSessionInfo, out int pCount);
+
+[DllImport("wtsapi32.dll")]
+public static extern void WTSFreeMemory(IntPtr pMemory);
+
+[DllImport("wtsapi32.dll", SetLastError = true)]
+public static extern bool WTSQuerySessionInformation(IntPtr hServer, int sessionId, int wtsInfoClass, out IntPtr ppBuffer, out int pBytesReturned);
+
+[StructLayout(LayoutKind.Sequential)]
+public struct WTS_SESSION_INFO {
+    public int SessionId;
+    [MarshalAs(UnmanagedType.LPStr)]
+    public string pWinStationName;
+    public int State;
+}
+'@ -UsingNamespace 'System.Runtime.InteropServices'
+}
+
+function Get-AllUserSessions {
+    <#
+        Enumerates every Terminal Services session on this machine (all
+        users, not just one) via the WTS API -- the primary, reliable
+        source Get-UserSessions filters against. Falls back to parsing
+        `quser` text output only if the WTS call itself fails outright
+        (e.g. wtsapi32.dll unavailable), since a fragile text parse is
+        still better than no data at all.
+    #>
+    $results = [System.Collections.Generic.List[object]]::new()
+    try {
+        Add-DashboardWtsApiType
+        $server = [IntPtr]::Zero  # local server
+        $sessionInfoPtr = [IntPtr]::Zero
+        $count = 0
+        $ok = [BetterRdp.Wts]::WTSEnumerateSessions($server, 0, 1, [ref]$sessionInfoPtr, [ref]$count)
+        if (-not $ok) { throw "WTSEnumerateSessions failed (Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))." }
+
+        try {
+            $structSize = [Runtime.InteropServices.Marshal]::SizeOf([type]'BetterRdp.Wts+WTS_SESSION_INFO')
+            for ($i = 0; $i -lt $count; $i++) {
+                $current = [IntPtr]::Add($sessionInfoPtr, $i * $structSize)
+                $info = [Runtime.InteropServices.Marshal]::PtrToStructure($current, [type]'BetterRdp.Wts+WTS_SESSION_INFO')
+
+                # WTSUserName = 5, WTSConnectState is already on $info.State
+                $userPtr = [IntPtr]::Zero; $userBytes = 0
+                $username = ''
+                if ([BetterRdp.Wts]::WTSQuerySessionInformation($server, $info.SessionId, 5, [ref]$userPtr, [ref]$userBytes)) {
+                    try { $username = [Runtime.InteropServices.Marshal]::PtrToStringAnsi($userPtr) }
+                    finally { [BetterRdp.Wts]::WTSFreeMemory($userPtr) }
+                }
+                if ([string]::IsNullOrWhiteSpace($username)) { continue }
+
+                # WTS_CONNECTSTATE_CLASS: 0=Active 1=Connected 2=ConnectQuery
+                # 3=Shadow 4=Disconnected 5=Idle 6=Listen 7=Reset 8=Down 9=Init
+                $stateName = switch ($info.State) {
+                    0 { 'Active' }
+                    1 { 'Connected' }
+                    4 { 'Disc' }
+                    5 { 'Idle' }
+                    default { 'Other' }
+                }
+                $sessionName = [string]$info.pWinStationName
+
+                $results.Add([pscustomobject]@{
+                    Username    = $username
+                    SessionId   = $info.SessionId
+                    SessionName = $sessionName
+                    State       = $stateName
+                    Online      = ($info.State -eq 0 -or $info.State -eq 1)
+                    IsRdp       = ($sessionName -like 'RDP-Tcp*')
+                    IsConsole   = ($sessionName -ieq 'Console')
+                })
+            }
+        } finally {
+            if ($sessionInfoPtr -ne [IntPtr]::Zero) { [BetterRdp.Wts]::WTSFreeMemory($sessionInfoPtr) }
+        }
+        return @($results)
+    } catch {
+        Write-Verbose "WTS session enumeration failed; falling back to quser text parsing. $($_.Exception.Message)"
+    }
+
+    # Fallback: parse `quser`'s fixed-width text output. Kept only as a
+    # last resort -- see Add-DashboardWtsApiType's comment for why this is
+    # not the primary path.
     foreach ($line in @(quser 2>$null)) {
         $text = [string]$line
         if ($text -match '^\s*>?\s*(\S+)(?:\s+(\S+))?\s+(\d+)\s+(\S+)') {
             $user = $matches[1]; $sessionName = if ($matches[2] -match '^rdp-tcp|^console$') { $matches[2] } else { '' }; $id = [int]$matches[3]; $state = $matches[4]
-            if ($user -ieq $Username) {
-                $sessions += [pscustomobject]@{ Username=$user; SessionId=$id; SessionName=$sessionName; State=$state; Online=($state -match '^(Active|Conn)$'); IsRdp=($sessionName -like 'rdp-tcp*'); IsConsole=($sessionName -ieq 'console') }
-            }
+            $results.Add([pscustomobject]@{ Username=$user; SessionId=$id; SessionName=$sessionName; State=$state; Online=($state -match '^(Active|Conn)$'); IsRdp=($sessionName -like 'rdp-tcp*'); IsConsole=($sessionName -ieq 'console') })
         }
     }
-    return @($sessions)
+    return @($results)
+}
+
+function Get-UserSessions {
+    param([Parameter(Mandatory)][string]$Username)
+    return @(Get-AllUserSessions | Where-Object { $_.Username -ieq $Username })
 }
 
 function Get-UserSession {
@@ -489,15 +599,50 @@ function Wait-DashboardRdpSession {
     return $null
 }
 
+function New-DashboardRdpFile {
+    <#
+        Remote Desktop Plus (rdp.exe) accepts an .rdp settings file as a
+        positional argument alongside its own /u: /p: overrides, so any
+        setting normally only available in an .rdp file -- like
+        "smart sizing:i:1" -- goes here instead of trying to invent a
+        CLI flag for it that rdp.exe doesn't have.
+    #>
+    param([Parameter(Mandatory)][string]$Username)
+
+    New-DirectoryIfMissing -Path $script:RdpFileCacheRoot
+    $path = Join-Path $script:RdpFileCacheRoot "$Username.rdp"
+    $lines = @(
+        "full address:s:$($script:RdpHost):$($script:RdpPort)"
+        "username:s:.\$Username"
+        'smart sizing:i:1'
+        'desktopwidth:i:1920'
+        'desktopheight:i:1080'
+        'screen mode id:i:1'
+        'authentication level:i:0'
+        'prompt for credentials:i:0'
+        'enablecredsspsupport:i:1'
+    )
+    Set-Content -LiteralPath $path -Value $lines -Encoding ASCII
+    return $path
+}
+
 function Invoke-DashboardRdpBootstrap {
     <#
         Launches a fully automated RDP login for a dashboard-managed account
         via Remote Desktop Plus. Connecting to the SAME endpoint for a user
         who already has a disconnected session reconnects it -- standard RDP
-        behavior -- so this doubles as both the initial connect and any
-        later reconnect; there is no separate "Start" step.
+        behavior -- so this doubles as both a fresh connect and any later
+        reconnect.
+
+        -Minimize is used by Start-DashboardHeadlessLoopback to arm a
+        background/anchor connection that keeps the session alive without
+        an RDP window sitting in the operator's way; a later interactive
+        Connect-DashboardRdp call reconnects the same session with a new,
+        visible client, which displaces (disconnects) the minimized one
+        automatically -- standard RDP behavior, not something this script
+        has to orchestrate itself.
     #>
-    param([Parameter(Mandatory)][string]$Username)
+    param([Parameter(Mandatory)][string]$Username, [switch]$Minimize)
 
     Assert-Administrator
     $rdpPlusPath = Resolve-RemoteDesktopPlusPath
@@ -508,25 +653,69 @@ function Invoke-DashboardRdpBootstrap {
     # Dashboard-managed local accounts always use the username as the Windows
     # account password (see New-DashboardUser), so the login is passed
     # explicitly and completes with no saved-credential prompt to click
-    # through.
+    # through. The generated .rdp file carries settings (like smart sizing)
+    # that have no dedicated rdp.exe CLI flag; /u: and /p: are still passed
+    # on the command line since a plaintext password can't be stored in the
+    # .rdp file itself.
+    $rdpFile = New-DashboardRdpFile -Username $Username
     $arguments = @(
-        "/v:$($script:RdpHost):$($script:RdpPort)",
+        "`"$rdpFile`"",
         "/u:.\$Username",
-        "/p:$Username",
-        '/w:1920',
-        '/h:1080'
+        "/p:$Username"
     )
 
     Write-Host "Starting Remote Desktop Plus for '$Username' at 1920x1080."
-    Start-Process -FilePath $rdpPlusPath -ArgumentList $arguments | Out-Null
+    $process = Start-Process -FilePath $rdpPlusPath -ArgumentList $arguments -PassThru
 
     # 45s, not 30s: a first-ever logon (profile creation, GPU/driver init)
     # can genuinely take longer than 30s.
     $session = Wait-DashboardRdpSession -Username $Username -TimeoutSeconds 45
     if ($null -eq $session) {
-        throw "RDP login for '$Username' did not produce an active RDP session within 45 seconds."
+        throw "RDP login for '$Username' did not produce an active RDP session within 45 seconds. Run 'query session' to check whether it actually connected -- if it shows Active, this is a detection issue rather than a failed login."
     }
-    return $session
+
+    if ($Minimize) { Set-DashboardWindowMinimized -ProcessId $process.Id }
+
+    return [pscustomobject]@{
+        Username  = $session.Username
+        SessionId = $session.SessionId
+        ProcessId = $process.Id
+    }
+}
+
+function Set-DashboardWindowMinimized {
+    <#
+        Best-effort minimize of an rdp.exe process's main window, used to
+        keep an "armed" headless loopback connection out of the operator's
+        way. A brand-new process's main window handle isn't available
+        immediately, so this polls briefly for it. Failure here is
+        non-fatal -- the RDP session itself is what matters; a window that
+        couldn't be minimized is just a cosmetic miss.
+    #>
+    param([Parameter(Mandatory)][int]$ProcessId, [int]$TimeoutSeconds = 10)
+
+    if (-not ('BetterRdp.Window' -as [type])) {
+        Add-Type -Namespace BetterRdp -Name Window -MemberDefinition @'
+[DllImport("user32.dll")]
+public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+'@ -UsingNamespace 'System.Runtime.InteropServices'
+    }
+    $SW_MINIMIZE = 6
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        try {
+            $proc = Get-Process -Id $ProcessId -ErrorAction Stop
+            $proc.Refresh()
+            if ($proc.MainWindowHandle -ne [IntPtr]::Zero) {
+                [BetterRdp.Window]::ShowWindow($proc.MainWindowHandle, $SW_MINIMIZE) | Out-Null
+                return
+            }
+        } catch {
+            return
+        }
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $deadline)
 }
 
 function ConvertTo-HashtableRecursive {
@@ -567,6 +756,20 @@ function Get-DefaultDashboardStateEntry {
         SessionState = 'Stopped'
         RdpSessionId = $null
         RdpConnectionStatus = 'Disconnected'
+        # Headless RDP Loopback: Start arms a background/anchor RDP
+        # connection to keep the session alive and ready; Connect launches
+        # a visible interactive connection that displaces it (standard RDP
+        # behavior -- reconnecting the same session disconnects the prior
+        # client). HeadlessArmed/HeadlessProcessId track that background
+        # connection so it can be re-armed automatically after the
+        # interactive client disconnects, and torn down cleanly on Stop.
+        HeadlessArmed = $false
+        HeadlessProcessId = $null
+        # Set by Stop-DashboardSession, cleared by Start/Connect. Tells the
+        # dashboard's auto re-arm monitor "the operator asked for this user
+        # to be stopped" so a session going offline after an explicit Stop
+        # stays stopped instead of being re-armed headless again.
+        StopRequested = $false
     }
 }
 
@@ -629,16 +832,8 @@ function New-DashboardUser {
     New-DirectoryIfMissing -Path $userRoot
 }
 
-function Connect-DashboardRdp {
-    <#
-        Connects (or reconnects) the selected user's RDP session. There is
-        no separate "Start" step -- Invoke-DashboardRdpBootstrap already
-        reconnects an existing disconnected session for the same user the
-        same way a fresh login works, so one action covers both.
-    #>
+function Assert-DashboardConnectPreconditions {
     param([Parameter(Mandatory)][string]$Username)
-    Assert-Administrator
-
     $knownUsers = @(Get-RemoteDesktopUsers | ForEach-Object { $_.Username })
     if ($knownUsers -notcontains $Username) {
         throw "'$Username' is not a member of the local 'Remote Desktop Users' group."
@@ -647,14 +842,91 @@ function Connect-DashboardRdp {
     if (-not $wrapperCheck.Success) {
         throw "RDP Wrapper is not correctly configured: $($wrapperCheck.Failures -join ', ')"
     }
+}
+
+function Stop-DashboardHeadlessLoopback {
+    <#
+        Kills a still-running headless loopback rdp.exe process for this
+        user, if any, and clears the tracking fields. Safe to call even if
+        nothing is armed. Does not sign the underlying Windows session off
+        -- that stays alive across headless -> interactive handoffs; only
+        Stop-DashboardSession does that.
+    #>
+    param([Parameter(Mandatory)][string]$Username, [hashtable]$State)
+
+    $ownState = $false
+    if ($null -eq $State) { $State = Get-DashboardState; $ownState = $true }
+    if ($State.ContainsKey($Username)) {
+        $entry = $State[$Username]
+        if ($entry.HeadlessArmed -and $entry.HeadlessProcessId) {
+            try {
+                $proc = Get-Process -Id ([int]$entry.HeadlessProcessId) -ErrorAction SilentlyContinue
+                if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+            } catch {}
+        }
+        $entry.HeadlessArmed = $false
+        $entry.HeadlessProcessId = $null
+    }
+    if ($ownState) { Save-DashboardState -State $State }
+}
+
+function Start-DashboardHeadlessLoopback {
+    <#
+        Arms a background/anchor RDP connection for this user: the same
+        automated login as Connect-DashboardRdp, but launched minimized so
+        it never shows an RDP window on the operator's desktop. This is the
+        "Start" step in the Headless RDP Loopback flow -- it exists to keep
+        the user's session alive and ready ("HEADLESS READY"), not to be
+        looked at. A later Connect-DashboardRdp call reconnects the same
+        session with a real, visible client, which displaces this one
+        automatically (standard RDP behavior).
+    #>
+    param([Parameter(Mandatory)][string]$Username)
+    Assert-Administrator
+    Assert-DashboardConnectPreconditions -Username $Username
+
+    $rdp = Invoke-DashboardRdpBootstrap -Username $Username -Minimize
+
+    $state = Get-DashboardState
+    if ($state.ContainsKey($Username)) {
+        $state[$Username].RdpSessionId = $rdp.SessionId
+        $state[$Username].RdpConnectionStatus = 'Headless'
+        $state[$Username].SessionState = 'Armed'
+        $state[$Username].HeadlessArmed = $true
+        $state[$Username].HeadlessProcessId = $rdp.ProcessId
+        $state[$Username].StopRequested = $false
+        Save-DashboardState -State $state
+    }
+    return $rdp
+}
+
+function Connect-DashboardRdp {
+    <#
+        Launches (or reconnects) the selected user's RDP session as a real,
+        visible, interactive client. If a headless loopback connection was
+        armed for this user, connecting again to the same session displaces
+        it automatically -- standard RDP behavior, reconnecting to an
+        existing session disconnects whichever client held it before. The
+        stale headless rdp.exe window (if it didn't already close on its
+        own) is cleaned up afterward.
+    #>
+    param([Parameter(Mandatory)][string]$Username)
+    Assert-Administrator
+    Assert-DashboardConnectPreconditions -Username $Username
+
+    $wasHeadless = $false
+    $state = Get-DashboardState
+    if ($state.ContainsKey($Username)) { $wasHeadless = [bool]$state[$Username].HeadlessArmed }
 
     $rdp = Invoke-DashboardRdpBootstrap -Username $Username
 
     $state = Get-DashboardState
     if ($state.ContainsKey($Username)) {
+        if ($wasHeadless) { Stop-DashboardHeadlessLoopback -Username $Username -State $state }
         $state[$Username].RdpSessionId = $rdp.SessionId
         $state[$Username].RdpConnectionStatus = 'Connected'
         $state[$Username].SessionState = 'Running'
+        $state[$Username].StopRequested = $false
         Save-DashboardState -State $state
     }
     return $rdp
@@ -662,18 +934,34 @@ function Connect-DashboardRdp {
 
 function Stop-DashboardSession {
     <#
-        Keep this simple: sign the user off.
+        Sign the user off, and tear down any armed headless loopback
+        connection along with it.
     #>
     param([Parameter(Mandatory)][string]$Username)
     $session = Get-UserSession -Username $Username
     if ($null -ne $session) { logoff $session.SessionId 2>$null }
 
     $state = Get-DashboardState
+    Stop-DashboardHeadlessLoopback -Username $Username -State $state
     if ($state.ContainsKey($Username)) {
         $state[$Username].SessionState = 'Stopped'
         $state[$Username].RdpConnectionStatus = 'Disconnected'
-        Save-DashboardState -State $state
+        $state[$Username].StopRequested = $true
     }
+    Save-DashboardState -State $state
+}
+
+function Open-DashboardRdpWrapperManager {
+    <#
+        Launches the RDP Wrapper manager/config UI directly, for manual
+        inspection or reconfiguration outside the dashboard's own
+        install/verify flow.
+    #>
+    param([string]$Path = $script:RdpWrapperManagerPath)
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "RDP Wrapper manager was not found at '$Path'."
+    }
+    Start-Process -FilePath $Path | Out-Null
 }
 
 function Test-DashboardInstallation {
@@ -687,4 +975,4 @@ function Test-DashboardInstallation {
     $checks.GetEnumerator() | ForEach-Object { [pscustomobject]@{ Check=$_.Key; Passed=[bool]$_.Value } }
 }
 
-Export-ModuleMember -Function *-Dashboard*,Install-*,Test-*,New-DashboardUser,Stop-DashboardSession,Connect-DashboardRdp,Assert-Administrator,Set-DashboardPaths,Invoke-RdpWrapperInstaller,Get-RdpEndpoint,Get-DashboardState,Get-RemoteDesktopUsers,Get-UserSession,Get-UserSessions,Get-UserRdpSessionId,Invoke-DashboardRdpBootstrap,Get-DefaultDashboardStateEntry
+Export-ModuleMember -Function *-Dashboard*,Install-*,Test-*,New-DashboardUser,Stop-DashboardSession,Connect-DashboardRdp,Assert-Administrator,Set-DashboardPaths,Invoke-RdpWrapperInstaller,Get-RdpEndpoint,Get-DashboardState,Get-RemoteDesktopUsers,Get-UserSession,Get-UserSessions,Get-AllUserSessions,Get-UserRdpSessionId,Invoke-DashboardRdpBootstrap,Get-DefaultDashboardStateEntry,Open-DashboardRdpWrapperManager
