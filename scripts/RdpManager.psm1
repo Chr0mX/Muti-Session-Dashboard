@@ -136,19 +136,20 @@ function global:New-DashboardRdpFile {
 
 function global:Set-DashboardWindowMinimized {
     <#
-        Best-effort minimize of an rdp.exe process's main window, used as a
-        backup to -Minimize's primary mechanism (Start-Process -WindowStyle
-        Minimized, which asks Windows to create the process already
-        minimized) to keep an "armed" headless loopback connection out of
-        the operator's way. A single one-shot "find the handle once, then
-        minimize and stop" was not enough in practice: a window that
-        appears late (or gets replaced/re-shown partway through RDP
-        negotiation, after the startup hint already applied to an earlier
-        window) can end up visible anyway. This instead keeps re-applying
-        ShowWindow for the whole timeout window -- cheap and idempotent --
-        so a late or re-shown window still gets caught. Failure here is
-        still non-fatal -- the RDP session itself is what matters; a
-        window that couldn't be minimized is just a cosmetic miss.
+        Best-effort minimize of an rdp.exe process's main window, used to
+        keep an "armed" headless loopback connection out of the operator's
+        way. This is the ONLY minimize mechanism -Minimize uses -- see
+        Invoke-DashboardRdpBootstrap's comment for why Start-Process
+        -WindowStyle Minimized was tried and reverted (it crashes RDP+
+        outright, a real bug in RDP+'s own startup code). A single
+        one-shot "find the handle once, then minimize and stop" was not
+        enough in practice either: a window that appears late (or gets
+        replaced/re-shown partway through RDP negotiation) can end up
+        visible anyway. This instead keeps re-applying ShowWindow for the
+        whole timeout window -- cheap and idempotent -- so a late or
+        re-shown window still gets caught. Failure here is still
+        non-fatal -- the RDP session itself is what matters; a window that
+        couldn't be minimized is just a cosmetic miss.
     #>
     param([Parameter(Mandatory)][int]$ProcessId, [int]$TimeoutSeconds = 15)
 
@@ -238,21 +239,23 @@ function global:Invoke-DashboardRdpBootstrap {
     )
 
     Write-Host "Starting Remote Desktop Plus for '$Username' at 1920x1080."
-    # -Minimize: prefer telling Windows to create the process with its main
-    # window already minimized (-WindowStyle Minimized, honored via the
-    # process's startup info by most GUI apps' initial show-window call)
-    # over only trying to catch and minimize the window after the fact --
-    # that's strictly more reliable since it doesn't depend on winning a
-    # race against however long the window takes to appear. A reported
-    # headless "Start" still showing a window pointed at exactly that race:
-    # Set-DashboardWindowMinimized (still called below as a backup, in case
-    # a later/secondary window doesn't honor the startup hint) polls for
-    # only a few seconds and only ever minimizes whatever MainWindowHandle
-    # it catches first, which can miss a window that appears or gets
-    # replaced later during connection negotiation.
-    $startParams = @{ FilePath = $rdpPlusPath; ArgumentList = $arguments; PassThru = $true }
-    if ($Minimize) { $startParams.WindowStyle = 'Minimized' }
-    $process = Start-Process @startParams
+    # -Minimize deliberately does NOT use Start-Process -WindowStyle
+    # Minimized, even though that's normally the more reliable mechanism
+    # for this. It was tried and reverted: it crashes RDP+ outright with
+    # "System.ArgumentException: Parameter is not valid" inside
+    # System.Drawing.Bitmap..ctor, thrown from RDP+'s own Form.OnLoad --
+    # a real bug in RDP+ itself, where it allocates a bitmap sized to its
+    # client area during startup without handling the client area being
+    # zero-sized, which is exactly what a window created already-minimized
+    # has. Creating the window NORMAL-sized first and minimizing it
+    # afterward (once it already has real dimensions) avoids ever
+    # triggering that path. Set-DashboardWindowMinimized below is that
+    # after-the-fact minimize, kept persistent (re-applies for its whole
+    # timeout window) specifically so it still catches a window that
+    # appears late or gets replaced during connection negotiation, without
+    # needing the startup-minimized approach that crashes this particular
+    # app.
+    $process = Start-Process -FilePath $rdpPlusPath -ArgumentList $arguments -PassThru
 
     # 45s, not 30s: a first-ever logon (profile creation, GPU/driver init)
     # can genuinely take longer than 30s. This is a blocking wait, which is
