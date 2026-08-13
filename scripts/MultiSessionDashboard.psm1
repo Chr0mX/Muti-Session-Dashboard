@@ -602,6 +602,33 @@ function global:Start-DashboardBackgroundTask {
 
     $asyncResult = $ps.BeginInvoke()
 
+    <#
+        A plain scriptblock literal does NOT keep its defining function
+        call's local variables alive once that call returns -- and
+        Start-DashboardBackgroundTask returns right after this point, well
+        before the timer ever ticks. Without .GetNewClosure(), the Tick
+        handler below would try to read $asyncResult (and everything else)
+        from a scope that's already gone, throwing "The variable ...
+        cannot be retrieved because it has not been set." (confirmed by
+        reproducing it). .GetNewClosure() snapshots the referenced
+        variables into the scriptblock's own storage at creation time,
+        independent of the original scope's lifetime.
+
+        That snapshot does NOT reliably chain through a second, nested
+        .GetNewClosure() called from inside an already-closed scriptblock
+        (also confirmed by reproducing it: a variable closed over by the
+        outer closure was empty inside a scriptblock closed a second time
+        from within it). So $successCallback/$errorCallback/$completeCallback
+        below are each built as their own single-level closure right here,
+        and the Tick handler calls them as already-built delegate objects,
+        passing $result/$message as a genuine Control.BeginInvoke argument
+        (plain .NET delegate-argument marshaling) rather than baking them
+        into a further nested closure.
+    #>
+    $successCallback = [Action[object]]({ param($r) & $OnSuccess $r }).GetNewClosure()
+    $errorCallback = [Action[string]]({ param($m) & $OnError $m }).GetNewClosure()
+    $completeCallback = [Action]({ & $OnComplete }).GetNewClosure()
+
     $pollTimer = New-Object System.Windows.Forms.Timer
     $pollTimer.Interval = 150
     $pollTimer.Add_Tick({
@@ -615,21 +642,21 @@ function global:Start-DashboardBackgroundTask {
             $items = @($output)
             $result = if ($items.Count -eq 1) { $items[0] } elseif ($items.Count -eq 0) { $null } else { $items }
             if ($Control.IsHandleCreated) {
-                $Control.BeginInvoke([Action]{ & $OnSuccess $result }) | Out-Null
+                $Control.BeginInvoke($successCallback, @($result)) | Out-Null
             }
         } catch {
             $message = $_.Exception.Message
             if ($Control.IsHandleCreated) {
-                $Control.BeginInvoke([Action]{ & $OnError $message }) | Out-Null
+                $Control.BeginInvoke($errorCallback, @($message)) | Out-Null
             }
         } finally {
             if ($Control.IsHandleCreated) {
-                $Control.BeginInvoke([Action]{ & $OnComplete }) | Out-Null
+                $Control.BeginInvoke($completeCallback, @()) | Out-Null
             }
             $ps.Dispose()
             $runspace.Dispose()
         }
-    })
+    }.GetNewClosure())
     $pollTimer.Start()
 }
 
