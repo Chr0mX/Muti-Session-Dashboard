@@ -12,11 +12,33 @@ Add-Type -AssemblyName Microsoft.VisualBasic
 
 
 
+# Defense in depth: an unhandled exception on any thread other than this
+# one (e.g. a bug in a background runspace's completion handling) would
+# otherwise take the whole process down instantly and silently -- no
+# console output, no dialog, just the window vanishing. Show it instead of
+# hiding it.
+[System.AppDomain]::CurrentDomain.add_UnhandledException({
+    param($senderObj, $eventArgs)
+    $exceptionMessage = try { $eventArgs.ExceptionObject.ToString() } catch { 'Unknown unhandled exception.' }
+    try {
+        [Windows.Forms.MessageBox]::Show($exceptionMessage, 'Multi Session Dashboard - Unhandled Error') | Out-Null
+    } catch {
+        Write-Host "UNHANDLED EXCEPTION: $exceptionMessage" -ForegroundColor Red
+    }
+})
+
+
+
 $module = Join-Path $PSScriptRoot 'MultiSessionDashboard.psm1'
 
 if (-not (Test-Path -LiteralPath $module)) { $module = 'C:\Program Files\Muti Session Dashboard\MultiSessionDashboard.psm1' }
 
-Import-Module $module -Force
+try {
+    Import-Module $module -Force -ErrorAction Stop
+} catch {
+    [Windows.Forms.MessageBox]::Show("Failed to load $module`:`n`n$($_.Exception.Message)", 'Multi Session Dashboard - Startup Error') | Out-Null
+    throw
+}
 
 
 
