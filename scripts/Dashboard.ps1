@@ -178,6 +178,13 @@ function Set-DashboardGridFromState {
     }
 }
 
+function Complete-DashboardMonitorTick {
+    # Plain top-level function, not a closure -- see Complete-DashboardAction's
+    # comment for why $script: writes belong here rather than directly
+    # inside a .GetNewClosure()'d scriptblock.
+    $script:MonitorTaskInFlight = $false
+}
+
 function Invoke-DashboardMonitorTick {
     # Fires every 2 seconds from $sessionTimer. Dispatches the entire
     # monitoring pass -- including any headless re-arm it decides to do --
@@ -189,10 +196,21 @@ function Invoke-DashboardMonitorTick {
     if ($script:DashboardActionInProgress -or $script:MonitorTaskInFlight) { return }
     $script:MonitorTaskInFlight = $true
 
+    # See Invoke-DashboardActionAsync's comment: named function calls made
+    # directly inside a .GetNewClosure()'d scriptblock are not reliable on
+    # Windows PowerShell 5.1, so functions are captured as scriptblock
+    # references and invoked with `&` here too, for consistency and
+    # defense-in-depth (this scriptblock doesn't strictly need
+    # .GetNewClosure() itself today since it has no local closure
+    # variables, but keeping the same safe shape everywhere avoids relying
+    # on that distinction staying true).
+    $setGridStateRef = ${function:Set-DashboardGridFromState}
+    $completeTickRef = ${function:Complete-DashboardMonitorTick}
+
     Start-DashboardBackgroundTask -Command 'Update-DashboardMonitorState' -Control $form `
-        -OnSuccess { param($Result) Set-DashboardGridFromState -State $Result } `
+        -OnSuccess { param($Result) & $setGridStateRef -State $Result }.GetNewClosure() `
         -OnError { param($ErrorMessage) Write-Verbose "Monitor tick failed: $ErrorMessage" } `
-        -OnComplete { $script:MonitorTaskInFlight = $false }
+        -OnComplete { & $completeTickRef }.GetNewClosure()
 }
 
 function Complete-DashboardAction {
@@ -247,9 +265,26 @@ function Invoke-DashboardActionAsync {
     # (this script has no Set-StrictMode, so that's not even an error --
     # `foreach ($button in $null)` just does nothing), which is exactly
     # what left every button permanently disabled after an action finished.
-    $onSuccess = { Set-Status $Success; Refresh-Grid }.GetNewClosure()
-    $onError = { param($ErrorMessage) Set-Status $ErrorMessage; [Windows.Forms.MessageBox]::Show($ErrorMessage, 'Multi Session Dashboard') | Out-Null }.GetNewClosure()
-    $onComplete = { Complete-DashboardAction -Buttons $actionButtons }.GetNewClosure()
+    #
+    # Named function calls made *directly inside* a .GetNewClosure()'d
+    # scriptblock are NOT reliable on the real target platform (Windows
+    # PowerShell 5.1) -- confirmed by a live crash report: calling
+    # Set-Status by name from inside such a scriptblock threw
+    # "The term 'Set-Status' is not recognized", even though the very
+    # same scriptblock's captured *variables* resolved fine. Captured
+    # ordinary variables and `&`-invoking a scriptblock already held in a
+    # variable are both reliable (this is the same mechanism
+    # Start-DashboardBackgroundTask itself uses to invoke -OnSuccess/
+    # -OnError/-OnComplete), so functions are captured as scriptblock
+    # references via ${function:Name} here and invoked with `&`, never by
+    # bare name, from inside any closure.
+    $setStatusRef = ${function:Set-Status}
+    $refreshGridRef = ${function:Refresh-Grid}
+    $completeActionRef = ${function:Complete-DashboardAction}
+
+    $onSuccess = { & $setStatusRef $Success; & $refreshGridRef }.GetNewClosure()
+    $onError = { param($ErrorMessage) & $setStatusRef $ErrorMessage; [Windows.Forms.MessageBox]::Show($ErrorMessage, 'Multi Session Dashboard') | Out-Null }.GetNewClosure()
+    $onComplete = { & $completeActionRef -Buttons $actionButtons }.GetNewClosure()
 
     Start-DashboardBackgroundTask -Command $Command -Params $Params -Control $form `
         -OnSuccess $onSuccess -OnError $onError -OnComplete $onComplete
