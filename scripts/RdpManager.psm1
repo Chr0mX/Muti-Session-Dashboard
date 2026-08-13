@@ -146,10 +146,15 @@ function global:Set-DashboardWindowMinimized {
     param([Parameter(Mandatory)][int]$ProcessId, [int]$TimeoutSeconds = 10)
 
     if (-not ('BetterRdp.Window' -as [type])) {
+        # No -UsingNamespace: Add-Type -MemberDefinition already includes
+        # `using System.Runtime.InteropServices;` by default, and passing
+        # it again fails to compile (CS0105) -- see the matching comment
+        # in SessionManager.psm1's Add-DashboardWtsApiType, where this was
+        # actually caught.
         Add-Type -Namespace BetterRdp -Name Window -MemberDefinition @'
 [DllImport("user32.dll")]
 public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-'@ -UsingNamespace 'System.Runtime.InteropServices'
+'@
     }
     $SW_MINIMIZE = 6
 
@@ -221,7 +226,25 @@ function global:Invoke-DashboardRdpBootstrap {
     # exactly why this whole function must run off the UI thread.
     $session = Wait-DashboardRdpSession -Username $Username -TimeoutSeconds 45
     if ($null -eq $session) {
-        throw "RDP login for '$Username' did not produce an active RDP session within 45 seconds. Run 'query session' to check whether it actually connected -- if it shows Active, this is a detection issue rather than a failed login."
+        # This exact timeout has been reported as a false failure before --
+        # `query session` independently shows the account Active while this
+        # wait still times out. Rather than guess again at what's wrong with
+        # detection, dump exactly what Get-UserSessions/Get-AllUserSessions
+        # actually saw for this user (every session found, whatever its
+        # state, plus which detection path -- WTS or the quser fallback --
+        # served it) directly into the error, so the next report is a
+        # diagnosis instead of a repeat of the same unexplained symptom.
+        $sourceInfo = Get-DashboardSessionSourceInfo
+        $observedSessions = @(Get-UserSessions -Username $Username)
+        $dump = if ($observedSessions.Count -eq 0) {
+            'none'
+        } else {
+            ($observedSessions | ForEach-Object {
+                "SessionId=$($_.SessionId) SessionName='$($_.SessionName)' State=$($_.State) Online=$($_.Online) IsRdp=$($_.IsRdp)"
+            }) -join '; '
+        }
+        $fallbackNote = if ($sourceInfo.FallbackReason) { " (fell back because: $($sourceInfo.FallbackReason))" } else { '' }
+        throw "RDP login for '$Username' did not produce an active RDP session within 45 seconds. Detection source: $($sourceInfo.Source)$fallbackNote. Sessions observed for '$Username': $dump. Run 'query session' to compare against what Windows itself reports."
     }
 
     if ($Minimize) { Set-DashboardWindowMinimized -ProcessId $process.Id }
