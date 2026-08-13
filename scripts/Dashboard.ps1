@@ -78,6 +78,8 @@ $form.Controls.Add($status)
 
 
 
+$script:DashboardActionInProgress = $false
+
 function Set-Status([string]$Text) { $status.Text = $Text; $form.Refresh() }
 
 function Get-SelectedUsername {
@@ -129,6 +131,12 @@ function Refresh-Grid {
 }
 
 function Update-SessionMonitor {
+    # Invoke-DashboardAction's Wait-DashboardRdpSession/Test-UserSunshineRunning
+    # polling loops pump the WinForms message loop internally so the window
+    # stays responsive, which means this timer's own Tick can fire while an
+    # action is still mid-flight. Skip this tick rather than let it read/write
+    # sessions.json concurrently with the in-flight action's own state calls.
+    if ($script:DashboardActionInProgress) { return }
     try {
         $state = Get-DashboardState
 
@@ -215,9 +223,29 @@ function Update-SessionMonitor {
 }
 
 function Invoke-DashboardAction([scriptblock]$Action, [string]$Success) {
+    # Start/Connect RDP/Update Sunshine can block for tens of seconds inside
+    # $Action (Wait-DashboardRdpSession / Test-UserSunshineRunning polling),
+    # which now pump the WinForms message loop internally (Invoke-DashboardUiPump)
+    # so the window doesn't appear to hang. Pumping means input messages -
+    # including another button's click - CAN be processed while $Action is
+    # still running, so disable every action button here to make that
+    # reentrant click a no-op instead of a second action racing the first.
+    $actionButtons = @($create, $start, $rdp, $moonlight, $stop, $refresh, $updateSunshine)
+    foreach ($button in $actionButtons) { $button.Enabled = $false }
+    $script:DashboardActionInProgress = $true
+    $form.Refresh()
 
-    try { & $Action; Set-Status $Success; Refresh-Grid } catch { Set-Status $_.Exception.Message; [Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Multi Session Dashboard') | Out-Null }
-
+    try {
+        & $Action
+        Set-Status $Success
+        Refresh-Grid
+    } catch {
+        Set-Status $_.Exception.Message
+        [Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Multi Session Dashboard') | Out-Null
+    } finally {
+        $script:DashboardActionInProgress = $false
+        foreach ($button in $actionButtons) { $button.Enabled = $true }
+    }
 }
 
 
