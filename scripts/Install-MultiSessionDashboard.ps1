@@ -3,20 +3,15 @@
 param(
     [string]$InstallRoot = 'C:\Program Files\Muti Session Dashboard',
     # Empty by default: Install-RdpWrapper then resolves the latest release
-    # through the GitHub API (like Moonlight/Sunshine below) so its download
-    # cache is keyed on the actual release version instead of the static
-    # 'latest/download/<fixed filename>' URL, whose text never changes
-    # between releases. Pass an explicit URL here to bypass that and
-    # download it directly instead.
+    # through the GitHub API so its download cache is keyed on the actual
+    # release version instead of the static 'latest/download/<fixed
+    # filename>' URL, whose text never changes between releases. Pass an
+    # explicit URL here to bypass that and download it directly instead.
     [string]$RdpWrapperUri = '',
     [string]$RdpWrapperReleaseApiUri = 'https://api.github.com/repos/sergiye/rdpWrapper/releases/latest',
     [string[]]$RdpWrapperAssetNamePatterns = @('(?i)^rdpWrapper_x64\.exe$', '(?i)^rdpWrapper.*x64.*\.exe$', '(?i)^rdpWrapper.*\.zip$'),
     [string[]]$RdpWrapperInstallArguments = @('-install'),
     [int]$RdpWrapperInstallTimeoutSeconds = 600,
-    [string]$MoonlightReleaseApiUri = 'https://api.github.com/repos/moonlight-stream/moonlight-qt/releases/latest',
-    [string[]]$MoonlightAssetNamePatterns = @('^MoonlightPortable-x64\.zip$', '^MoonlightPortable-x64-.*\.zip$', '^MoonlightPortable.*x64.*\.zip$'),
-    [string]$SunshineReleaseApiUri = 'https://api.github.com/repos/LizardByte/Sunshine/releases/latest',
-    [string[]]$SunshineAssetNamePatterns = @('(?i)^sunshine-windows-portable\.zip$', '(?i)^sunshine-windows.*portable.*\.zip$', '(?i)^sunshine.*windows.*portable.*\.zip$', '(?i)^sunshine.*portable.*windows.*\.zip$'),
     [string]$RemoteDesktopPlusUri = 'https://www.donkz.nl/download/remote-desktop-plus-msi/',
     [int]$RemoteDesktopPlusInstallTimeoutSeconds = 300,
     [switch]$RefreshDownloadCache
@@ -35,8 +30,6 @@ Assert-Administrator
 
 $directories = @(
     $InstallRoot,
-    (Join-Path $InstallRoot 'Stream\Moonlight'),
-    (Join-Path $InstallRoot 'Stream\Sunshine'),
     (Join-Path $InstallRoot 'Config'),
     (Join-Path $InstallRoot 'Users')
 )
@@ -50,23 +43,8 @@ Copy-Item -LiteralPath $modulePath -Destination (Join-Path $InstallRoot 'MultiSe
 Write-Host 'Installing RDP Wrapper...'
 Install-RdpWrapper -Source $RdpWrapperUri -ReleaseApiUri $RdpWrapperReleaseApiUri -AssetNamePatterns $RdpWrapperAssetNamePatterns -InstallArguments $RdpWrapperInstallArguments -InstallTimeoutSeconds $RdpWrapperInstallTimeoutSeconds
 
-Write-Host 'Installing Moonlight Portable...'
-Install-MoonlightPortable -ReleaseApiUri $MoonlightReleaseApiUri -AssetNamePatterns $MoonlightAssetNamePatterns
-
-Write-Host 'Installing Sunshine Portable...'
-Install-SunshinePortable -ReleaseApiUri $SunshineReleaseApiUri -AssetNamePatterns $SunshineAssetNamePatterns
-
 Write-Host 'Installing Remote Desktop Plus...'
 Install-RemoteDesktopPlus -Source $RemoteDesktopPlusUri -InstallTimeoutSeconds $RemoteDesktopPlusInstallTimeoutSeconds
-
-Write-Host 'Using native Windows tscon for RDP session handoff and Remote Desktop Plus for automated RDP login on 127.0.0.2:3389...'
-if (-not (Test-TsconAvailable)) { throw 'tscon.exe is required but was not found in System32.' }
-
-Write-Host 'Granting SeTcbPrivilege to Administrators (required for tscon to hand sessions to console)...'
-Grant-DashboardTcbPrivilege
-if (-not (Test-CurrentTokenHasTcbPrivilege)) {
-    Write-Warning "SeTcbPrivilege was granted to Administrators, but this session's own logon token does not have it yet -- log off and back on (or reboot) before using Start/Connect RDP."
-}
 
 $checks = Test-DashboardInstallation
 $checks | Format-Table -AutoSize
