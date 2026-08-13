@@ -105,11 +105,7 @@ function Refresh-Grid {
             if ([string]::IsNullOrWhiteSpace($key)) { continue }
 
             if (-not $state.ContainsKey($key)) {
-                $state[$key] = @{
-                    Username=$key; AccountName=$user.AccountName; SunshinePort=$null;
-                    SunshineLoopback=$null; SessionState='Stopped'; SunshineState='Stopped';
-                    RdpSessionId=$null; RdpConnectionStatus='Disconnected'; SunshineProcessId=$null
-                }
+                $state[$key] = Get-DefaultDashboardStateEntry -Username $key -AccountName $user.AccountName
             }
 
             $entry = $state[$key]
@@ -145,11 +141,7 @@ function Update-SessionMonitor {
             $key = [string]$user.Username
             if ([string]::IsNullOrWhiteSpace($key)) { continue }
             if (-not $state.ContainsKey($key)) {
-                $state[$key] = @{
-                    Username=$key; AccountName=$user.AccountName; SunshinePort=$null;
-                    SunshineLoopback=$null; SessionState='Stopped'; SunshineState='Stopped';
-                    RdpSessionId=$null; RdpConnectionStatus='Disconnected'; SunshineProcessId=$null
-                }
+                $state[$key] = Get-DefaultDashboardStateEntry -Username $key -AccountName $user.AccountName
             }
             $entry = $state[$key]
             $hasWindowsSession = $false

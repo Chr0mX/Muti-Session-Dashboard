@@ -2,7 +2,15 @@
 [CmdletBinding()]
 param(
     [string]$InstallRoot = 'C:\Program Files\Muti Session Dashboard',
-    [string]$RdpWrapperUri = 'https://github.com/sergiye/rdpWrapper/releases/latest/download/rdpWrapper_x64.exe',
+    # Empty by default: Install-RdpWrapper then resolves the latest release
+    # through the GitHub API (like Moonlight/Sunshine below) so its download
+    # cache is keyed on the actual release version instead of the static
+    # 'latest/download/<fixed filename>' URL, whose text never changes
+    # between releases. Pass an explicit URL here to bypass that and
+    # download it directly instead.
+    [string]$RdpWrapperUri = '',
+    [string]$RdpWrapperReleaseApiUri = 'https://api.github.com/repos/sergiye/rdpWrapper/releases/latest',
+    [string[]]$RdpWrapperAssetNamePatterns = @('(?i)^rdpWrapper_x64\.exe$', '(?i)^rdpWrapper.*x64.*\.exe$', '(?i)^rdpWrapper.*\.zip$'),
     [string[]]$RdpWrapperInstallArguments = @('-install'),
     [int]$RdpWrapperInstallTimeoutSeconds = 600,
     [string]$MoonlightReleaseApiUri = 'https://api.github.com/repos/moonlight-stream/moonlight-qt/releases/latest',
@@ -40,12 +48,12 @@ Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Dashboard.ps1') -Destination (J
 Copy-Item -LiteralPath $modulePath -Destination (Join-Path $InstallRoot 'MultiSessionDashboard.psm1') -Force
 
 Write-Host 'Installing RDP Wrapper...'
-Install-RdpWrapper -Source $RdpWrapperUri -InstallArguments $RdpWrapperInstallArguments -InstallTimeoutSeconds $RdpWrapperInstallTimeoutSeconds
+Install-RdpWrapper -Source $RdpWrapperUri -ReleaseApiUri $RdpWrapperReleaseApiUri -AssetNamePatterns $RdpWrapperAssetNamePatterns -InstallArguments $RdpWrapperInstallArguments -InstallTimeoutSeconds $RdpWrapperInstallTimeoutSeconds
 
 Write-Host 'Installing Moonlight Portable...'
 Install-MoonlightPortable -ReleaseApiUri $MoonlightReleaseApiUri -AssetNamePatterns $MoonlightAssetNamePatterns
 
-Write-Host 'Installing Sunshine Portable master copy...'
+Write-Host 'Installing Sunshine Portable...'
 Install-SunshinePortable -ReleaseApiUri $SunshineReleaseApiUri -AssetNamePatterns $SunshineAssetNamePatterns
 
 Write-Host 'Installing Remote Desktop Plus...'

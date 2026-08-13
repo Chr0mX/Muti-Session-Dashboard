@@ -154,16 +154,42 @@ function Invoke-RdpWrapperInstaller {
 }
 
 function Install-RdpWrapper {
+    <#
+        By default resolves the latest release through the GitHub API (like
+        Install-MoonlightPortable/Install-SunshinePortable) rather than only
+        ever downloading the static '.../releases/latest/download/<fixed
+        filename>' URL. That URL's text -- and the asset's filename -- never
+        changes between releases, so a download cache keyed on it alone can
+        never tell a stale cached copy apart from a newer release; the cache
+        name below is keyed on the resolved release tag instead, so normal
+        caching correctly reuses a hit for an unchanged release and
+        correctly re-downloads when a new one is published -- no need to
+        force-wipe the whole download cache to pick up updates.
+
+        Pass -Source to bypass API resolution entirely and download a
+        specific URL directly (kept for advanced/offline-mirror use).
+    #>
     param(
-        [string]$Source = 'https://github.com/sergiye/rdpWrapper/releases/latest/download/rdpWrapper_x64.exe',
+        [string]$Source,
+        [string]$ReleaseApiUri = 'https://api.github.com/repos/sergiye/rdpWrapper/releases/latest',
+        [string[]]$AssetNamePatterns = @('(?i)^rdpWrapper_x64\.exe$', '(?i)^rdpWrapper.*x64.*\.exe$', '(?i)^rdpWrapper.*\.zip$'),
         [string[]]$InstallArguments = @('-install'),
         [int]$InstallTimeoutSeconds = 600
     )
     New-DirectoryIfMissing -Path $script:RdpWrapperRoot
-    $extension = [IO.Path]::GetExtension(([Uri]$Source).AbsolutePath)
+
+    $downloadUri = $Source
+    $cacheName = 'rdpWrapper'
+    if ([string]::IsNullOrWhiteSpace($downloadUri)) {
+        $asset = Resolve-GitHubLatestReleaseAsset -ReleaseApiUri $ReleaseApiUri -AssetNamePatterns $AssetNamePatterns -ComponentName 'RDP Wrapper'
+        $downloadUri = $asset.Uri
+        $cacheName = "rdpWrapper-$($asset.Release)"
+    }
+
+    $extension = [IO.Path]::GetExtension(([Uri]$downloadUri).AbsolutePath)
     if ([string]::IsNullOrWhiteSpace($extension)) { $extension = '.download' }
     $package = Join-Path $env:TEMP "rdpWrapper$extension"
-    Invoke-DownloadFile -Uri $Source -Destination $package -CacheName 'rdpWrapper' | Out-Null
+    Invoke-DownloadFile -Uri $downloadUri -Destination $package -CacheName $cacheName | Out-Null
 
     if ($extension -ieq '.zip') {
         Expand-ArchiveSafe -Archive $package -Destination $script:RdpWrapperRoot
@@ -176,7 +202,7 @@ function Install-RdpWrapper {
         Copy-Item -LiteralPath $package -Destination $installer -Force
         Invoke-RdpWrapperInstaller -FilePath $installer -WorkingDirectory $script:RdpWrapperRoot -ArgumentList $InstallArguments -TimeoutSeconds $InstallTimeoutSeconds
     } else {
-        throw "Unsupported RDP Wrapper package type '$extension' from $Source"
+        throw "Unsupported RDP Wrapper package type '$extension' from $downloadUri"
     }
 
     Set-RdpWrapperConfiguration
@@ -497,17 +523,7 @@ function Get-DashboardUsers {
 
     foreach ($user in $users) {
         if (-not $state.ContainsKey($user.Username)) {
-            $state[$user.Username] = @{
-                Username = $user.Username
-                AccountName = $user.AccountName
-                SunshinePort = $null
-                SunshineLoopback = $null
-                SessionState = 'Stopped'
-                SunshineState = 'Stopped'
-                RdpSessionId = $null
-                RdpConnectionStatus = 'Disconnected'
-                SunshineProcessId = $null
-            }
+            $state[$user.Username] = Get-DefaultDashboardStateEntry -Username $user.Username -AccountName $user.AccountName
         } else {
             $state[$user.Username].Username = $user.Username
             $state[$user.Username].AccountName = $user.AccountName
@@ -674,13 +690,60 @@ function ConvertTo-HashtableRecursive {
     }
 }
 
+function Get-DefaultDashboardStateEntry {
+    <#
+        The single source of truth for a state entry's full key set. Used
+        both for brand-new entries and by Repair-DashboardStateEntry to
+        back-fill entries loaded from an older sessions.json -- keeping the
+        shape in one place instead of duplicating a hashtable literal at
+        every call site (which is exactly how the last field added here
+        ended up missing from some of them).
+    #>
+    param([Parameter(Mandatory)][string]$Username, [string]$AccountName)
+    if ([string]::IsNullOrWhiteSpace($AccountName)) { $AccountName = ".\$Username" }
+    return @{
+        Username = $Username
+        AccountName = $AccountName
+        SunshinePort = $null
+        SunshineLoopback = $null
+        SessionState = 'Stopped'
+        SunshineState = 'Stopped'
+        RdpSessionId = $null
+        RdpConnectionStatus = 'Disconnected'
+        SunshineProcessId = $null
+    }
+}
+
+function Repair-DashboardStateEntry {
+    <#
+        Set-StrictMode -Version Latest throws "property ... cannot be found"
+        on dot-access to a hashtable key that simply isn't there -- so an
+        entry written by an older version of this module (before
+        SunshineLoopback/SunshineProcessId existed, or before any future
+        field) crashes the first time anything reads it that way. Back-fill
+        any missing keys with their default value so every entry always has
+        the full current shape, regardless of when it was first created.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Entry, [Parameter(Mandatory)][string]$Username)
+    $accountName = if ($Entry.ContainsKey('AccountName')) { $Entry['AccountName'] } else { $null }
+    $defaults = Get-DefaultDashboardStateEntry -Username $Username -AccountName $accountName
+    foreach ($key in $defaults.Keys) {
+        if (-not $Entry.ContainsKey($key)) { $Entry[$key] = $defaults[$key] }
+    }
+    return $Entry
+}
+
 function Get-DashboardState {
     New-DirectoryIfMissing -Path $script:ConfigRoot
     if (-not (Test-Path -LiteralPath $script:StateFile)) { return @{} }
     $json = Get-Content -LiteralPath $script:StateFile -Raw
     if ([string]::IsNullOrWhiteSpace($json)) { return @{} }
     $obj = $json | ConvertFrom-Json
-    return (ConvertTo-HashtableRecursive $obj)
+    $state = ConvertTo-HashtableRecursive $obj
+    foreach ($username in @($state.Keys)) {
+        $state[$username] = Repair-DashboardStateEntry -Entry $state[$username] -Username $username
+    }
+    return $state
 }
 
 function Save-DashboardState { param([hashtable]$State) $State | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $script:StateFile -Encoding UTF8 }
@@ -855,7 +918,8 @@ function Get-AllocatedPort {
                 # existing user already had recorded.
                 $state[$Username].SunshinePort = $port
             } else {
-                $state[$Username] = @{ Username=$Username; AccountName=".\$Username"; SunshinePort=$port; SunshineLoopback=$null; SessionState='Stopped'; SunshineState='Stopped'; RdpSessionId=$null; RdpConnectionStatus='Disconnected'; SunshineProcessId=$null }
+                $state[$Username] = Get-DefaultDashboardStateEntry -Username $Username
+                $state[$Username].SunshinePort = $port
             }
             Save-DashboardState -State $state
         }
@@ -892,7 +956,8 @@ function Get-AllocatedLoopback {
             if ($state.ContainsKey($Username)) {
                 $state[$Username].SunshineLoopback = $address
             } else {
-                $state[$Username] = @{ Username=$Username; AccountName=".\$Username"; SunshinePort=$null; SunshineLoopback=$address; SessionState='Stopped'; SunshineState='Stopped'; RdpSessionId=$null; RdpConnectionStatus='Disconnected'; SunshineProcessId=$null }
+                $state[$Username] = Get-DefaultDashboardStateEntry -Username $Username
+                $state[$Username].SunshineLoopback = $address
             }
             Save-DashboardState -State $state
         }
@@ -1174,4 +1239,4 @@ function Test-DashboardInstallation {
     $checks.GetEnumerator() | ForEach-Object { [pscustomobject]@{ Check=$_.Key; Passed=[bool]$_.Value } }
 }
 
-Export-ModuleMember -Function *-Dashboard*,Install-*,Test-*,New-DashboardUser,Start-DashboardSession,Stop-DashboardSession,Connect-DashboardRdp,Keep-Alive-DashboardRdp,Connect-DashboardMoonlight,Assert-Administrator,Set-DashboardPaths,Invoke-RdpWrapperInstaller,Get-RdpEndpoint,Get-DashboardState,Get-RemoteDesktopUsers,Get-UserSession,Get-UserSessions,Get-UserRdpSessionId,Get-UserConsoleSession,Maintain-DashboardSession,Invoke-DashboardRdpBootstrap
+Export-ModuleMember -Function *-Dashboard*,Install-*,Test-*,New-DashboardUser,Start-DashboardSession,Stop-DashboardSession,Connect-DashboardRdp,Keep-Alive-DashboardRdp,Connect-DashboardMoonlight,Assert-Administrator,Set-DashboardPaths,Invoke-RdpWrapperInstaller,Get-RdpEndpoint,Get-DashboardState,Get-RemoteDesktopUsers,Get-UserSession,Get-UserSessions,Get-UserRdpSessionId,Get-UserConsoleSession,Maintain-DashboardSession,Invoke-DashboardRdpBootstrap,Get-DefaultDashboardStateEntry
