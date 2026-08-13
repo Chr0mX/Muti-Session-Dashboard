@@ -195,6 +195,28 @@ function Invoke-DashboardMonitorTick {
         -OnComplete { $script:MonitorTaskInFlight = $false }
 }
 
+function Complete-DashboardAction {
+    <#
+        Does the actual "an action just finished" work: clears the
+        in-progress flag and re-enables the buttons. Called from
+        Invoke-DashboardActionAsync's -OnComplete closure rather than
+        having that closure set $script:DashboardActionInProgress itself
+        -- confirmed by reproducing it: a `$script:X = value` assignment
+        made *directly inside* a scriptblock that has had .GetNewClosure()
+        called on it does not write back to the real script-scope
+        variable (it silently goes to a detached copy), even though the
+        very same assignment made inside an ordinary function -- called
+        FROM a closure, rather than being part of one -- works correctly.
+        Keeping this as a plain top-level function sidesteps that
+        entirely: it isn't a closure itself, so its own `$script:` write
+        resolves normally regardless of how deeply nested the closure
+        chain that called it is.
+    #>
+    param($Buttons)
+    $script:DashboardActionInProgress = $false
+    foreach ($button in $Buttons) { $button.Enabled = $true }
+}
+
 function Invoke-DashboardActionAsync {
     <#
         Runs a module command that can legitimately block for seconds (RDP
@@ -214,13 +236,23 @@ function Invoke-DashboardActionAsync {
     $script:DashboardActionInProgress = $true
     if ($Params.ContainsKey('Username')) { Set-Status "Working on $($Params.Username)..." } else { Set-Status 'Working...' }
 
+    # .GetNewClosure() is required here, not optional: this function
+    # returns as soon as Start-DashboardBackgroundTask has been called
+    # (it dispatches to a background runspace and returns immediately),
+    # well before -OnSuccess/-OnError/-OnComplete are actually invoked.
+    # A plain scriptblock literal does not keep this function's local
+    # variables ($actionButtons, $Success) reachable once this call has
+    # returned -- confirmed by reproducing it: without .GetNewClosure(),
+    # $actionButtons silently becomes $null by the time -OnComplete runs
+    # (this script has no Set-StrictMode, so that's not even an error --
+    # `foreach ($button in $null)` just does nothing), which is exactly
+    # what left every button permanently disabled after an action finished.
+    $onSuccess = { Set-Status $Success; Refresh-Grid }.GetNewClosure()
+    $onError = { param($ErrorMessage) Set-Status $ErrorMessage; [Windows.Forms.MessageBox]::Show($ErrorMessage, 'Multi Session Dashboard') | Out-Null }.GetNewClosure()
+    $onComplete = { Complete-DashboardAction -Buttons $actionButtons }.GetNewClosure()
+
     Start-DashboardBackgroundTask -Command $Command -Params $Params -Control $form `
-        -OnSuccess { Set-Status $Success; Refresh-Grid } `
-        -OnError { param($ErrorMessage) Set-Status $ErrorMessage; [Windows.Forms.MessageBox]::Show($ErrorMessage, 'Multi Session Dashboard') | Out-Null } `
-        -OnComplete {
-            $script:DashboardActionInProgress = $false
-            foreach ($button in $actionButtons) { $button.Enabled = $true }
-        }
+        -OnSuccess $onSuccess -OnError $onError -OnComplete $onComplete
 }
 
 
