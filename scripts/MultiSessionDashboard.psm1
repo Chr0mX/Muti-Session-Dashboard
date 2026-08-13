@@ -819,7 +819,19 @@ function Install-UserSunshineFiles {
     $profile = Join-Path 'C:\Users' $Username
     $dest = Join-Path $profile 'AppData\Local\Muti Session Dashboard\Sunshine'
     New-DirectoryIfMissing -Path $dest
-    Copy-Item -LiteralPath (Join-Path $master '*') -Destination $dest -Recurse -Force
+
+    # -LiteralPath disables wildcard expansion, so Copy-Item -LiteralPath
+    # "$master\*" was looking for a file literally named "*" -- which never
+    # exists -- and failing as a non-terminating error that nothing here
+    # caught, leaving $dest empty with no error ever surfacing. Enumerate
+    # $master's contents (LiteralPath is safe there, no globbing needed) and
+    # copy each item instead; -ErrorAction Stop makes any real copy failure
+    # (locked file, permissions, disk full) throw immediately too.
+    Get-ChildItem -LiteralPath $master -Force | Copy-Item -Destination $dest -Recurse -Force -ErrorAction Stop
+    if (-not (Test-Path -LiteralPath (Join-Path $dest 'sunshine.exe'))) {
+        throw "sunshine.exe was not found in '$dest' after copying from '$master'."
+    }
+
     $configDir = Join-Path $profile 'AppData\Local\Muti Session Dashboard\Config'
     New-DirectoryIfMissing -Path $configDir
 
