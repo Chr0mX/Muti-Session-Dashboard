@@ -11,6 +11,26 @@ $script:PortEnd = 48050
 $script:RdpHost = '127.0.0.2'
 $script:RdpPort = 3389
 $script:RdpPlusPath = 'C:\Program Files (x86)\Remote Desktop Plus\rdp.exe'
+$script:ComponentVersionsFile = Join-Path $script:ConfigRoot 'component-versions.json'
+# .1 is the host and .2 is reserved by the RDP Wrapper session-handoff trick
+# (see Invoke-DashboardRdpBootstrap), so per-user Sunshine loopback addresses
+# start at .3. See Get-AllocatedLoopback.
+$script:SunshineLoopbackStartOctet = 3
+
+# Sunshine's 'port' config value is the base of a fixed *family* of ports,
+# each offset from it by a documented, unconfigurable amount -- not a single
+# port. See https://docs.lizardbyte.dev/projects/sunshine/master/md_docs_2configuration.html
+$script:SunshinePortOffsets = [ordered]@{
+    Https   = -5  # TCP
+    Http    = 0   # TCP -- the configured 'port' value itself
+    Web     = 1   # TCP
+    Video   = 9   # UDP
+    Control = 10  # UDP
+    Audio   = 11  # UDP
+    Mic     = 13  # UDP (unused)
+    Rtsp    = 21  # TCP
+}
+$script:SunshineUdpPortNames = @('Video', 'Control', 'Audio', 'Mic')
 
 
 function Set-DashboardPaths {
@@ -20,6 +40,7 @@ function Set-DashboardPaths {
     $script:UsersRoot = Join-Path $script:InstallRoot 'Users'
     $script:StateFile = Join-Path $script:ConfigRoot 'sessions.json'
     $script:DownloadCacheRoot = Join-Path $script:ConfigRoot 'Downloads'
+    $script:ComponentVersionsFile = Join-Path $script:ConfigRoot 'component-versions.json'
 }
 
 function Assert-Administrator {
@@ -198,6 +219,29 @@ function Install-RemoteDesktopPlus {
     }
 }
 
+function Resolve-RemoteDesktopPlusPath {
+    <#
+        Confirms rdp.exe's location rather than only ever assuming the
+        hard-coded install path: if it isn't there (a different MSI version,
+        a manual install), search both Program Files roots for it and cache
+        whatever is found for the rest of this session.
+    #>
+    if (Test-Path -LiteralPath $script:RdpPlusPath) { return $script:RdpPlusPath }
+
+    $roots = @('C:\Program Files (x86)', 'C:\Program Files') | Where-Object { Test-Path -LiteralPath $_ }
+    foreach ($root in $roots) {
+        $found = Get-ChildItem -LiteralPath $root -Filter 'rdp.exe' -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.DirectoryName -like '*Remote Desktop Plus*' } |
+            Select-Object -First 1
+        if ($found) {
+            $script:RdpPlusPath = $found.FullName
+            return $script:RdpPlusPath
+        }
+    }
+
+    return $script:RdpPlusPath
+}
+
 
 function Enable-RemoteDesktopFirewallRules {
     $rules = Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
@@ -289,6 +333,7 @@ function Install-MoonlightPortable {
     $asset = Resolve-GitHubLatestReleaseAsset -ReleaseApiUri $ReleaseApiUri -AssetNamePatterns $AssetNamePatterns -ComponentName 'Moonlight Portable'
     Install-PortableZip -Name 'moonlight' -Uri $asset.Uri -Destination (Join-Path $script:InstallRoot 'Stream\Moonlight')
     if (-not (Test-Path -LiteralPath (Join-Path $script:InstallRoot 'Stream\Moonlight\Moonlight.exe'))) { throw 'Moonlight.exe was not found after extraction.' }
+    Save-ComponentVersion -Component 'Moonlight' -Version $asset.Release
 }
 
 function Install-SunshinePortable {
@@ -354,6 +399,7 @@ function Install-SunshinePortable {
 
     Write-Host "Sunshine Portable installed successfully."
     Write-Host "Executable: $expectedExe"
+    Save-ComponentVersion -Component 'Sunshine' -Version $asset.Release
 }
 
 function Test-TsconAvailable {
@@ -455,10 +501,12 @@ function Get-DashboardUsers {
                 Username = $user.Username
                 AccountName = $user.AccountName
                 SunshinePort = $null
+                SunshineLoopback = $null
                 SessionState = 'Stopped'
                 SunshineState = 'Stopped'
                 RdpSessionId = $null
                 RdpConnectionStatus = 'Disconnected'
+                SunshineProcessId = $null
             }
         } else {
             $state[$user.Username].Username = $user.Username
@@ -560,8 +608,9 @@ function Invoke-DashboardRdpBootstrap {
     param([Parameter(Mandatory)][string]$Username)
 
     Assert-Administrator
-    if (-not (Test-Path -LiteralPath $script:RdpPlusPath)) {
-        throw "Remote Desktop Plus was not found at '$script:RdpPlusPath'. Re-run the installer to install it."
+    $rdpPlusPath = Resolve-RemoteDesktopPlusPath
+    if (-not (Test-Path -LiteralPath $rdpPlusPath)) {
+        throw "Remote Desktop Plus was not found at '$rdpPlusPath'. Re-run the installer to install it."
     }
 
     # Dashboard-managed local accounts always use the username as the Windows
@@ -579,7 +628,7 @@ function Invoke-DashboardRdpBootstrap {
     )
 
     Write-Host "Starting Remote Desktop Plus for '$Username' at 1920x1080."
-    Start-Process -FilePath $script:RdpPlusPath -ArgumentList $arguments | Out-Null
+    Start-Process -FilePath $rdpPlusPath -ArgumentList $arguments | Out-Null
 
     $session = Wait-DashboardRdpSession -Username $Username -TimeoutSeconds 30
     if ($null -eq $session) {
@@ -636,6 +685,27 @@ function Get-DashboardState {
 
 function Save-DashboardState { param([hashtable]$State) $State | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $script:StateFile -Encoding UTF8 }
 
+function Get-ComponentVersions {
+    if (-not (Test-Path -LiteralPath $script:ComponentVersionsFile)) { return @{} }
+    $json = Get-Content -LiteralPath $script:ComponentVersionsFile -Raw
+    if ([string]::IsNullOrWhiteSpace($json)) { return @{} }
+    return (ConvertTo-HashtableRecursive ($json | ConvertFrom-Json))
+}
+
+function Save-ComponentVersion {
+    <#
+        Persists the resolved release tag for a downloaded component so a
+        future run can tell what's currently installed without re-querying
+        the release API -- the "store version information for future update
+        checks" step the installer functions otherwise discard.
+    #>
+    param([Parameter(Mandatory)][string]$Component, [Parameter(Mandatory)][string]$Version)
+    New-DirectoryIfMissing -Path $script:ConfigRoot
+    $versions = Get-ComponentVersions
+    $versions[$Component] = @{ Version = $Version; InstalledAt = (Get-Date).ToString('o') }
+    $versions | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:ComponentVersionsFile -Encoding UTF8
+}
+
 function New-DashboardUser {
     <#
         Dashboard-managed accounts always get the username as their Windows
@@ -661,33 +731,132 @@ function New-DashboardUser {
     Initialize-UserSunshine -Username $Username
 }
 
-function Initialize-UserSunshine {
-    param([Parameter(Mandatory)][string]$Username)
+function Install-UserSunshineFiles {
+    <#
+        Copies the current master Sunshine install into a user's per-user
+        directory and (re)writes their config/apps.json/Startup shortcut.
+        Shared by Initialize-UserSunshine (new user) and
+        Update-DashboardUserSunshine (existing user, e.g. after a newer
+        Sunshine release was installed) so both stay in sync.
+    #>
+    param([Parameter(Mandatory)][string]$Username, [switch]$ReservePort)
+
     $master = Join-Path $script:InstallRoot 'Stream\Sunshine'
-    if (-not (Test-Path -LiteralPath (Join-Path $master 'Sunshine.exe'))) { throw 'Master Sunshine installation is missing.' }
+    if (-not (Test-Path -LiteralPath (Join-Path $master 'sunshine.exe'))) {
+        throw 'Master Sunshine installation is missing. Run the installer to install/update it first.'
+    }
+
+    # Stop any running copy first so an in-use sunshine.exe doesn't block the
+    # copy; it comes back automatically at the user's next logon (Startup
+    # folder) or the next time the operator Starts/reconnects the session.
+    Get-Process -Name 'Sunshine' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -like "C:\Users\$Username\AppData\Local\Muti Session Dashboard\Sunshine\*" } |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+
     $profile = Join-Path 'C:\Users' $Username
     $dest = Join-Path $profile 'AppData\Local\Muti Session Dashboard\Sunshine'
     New-DirectoryIfMissing -Path $dest
     Copy-Item -LiteralPath (Join-Path $master '*') -Destination $dest -Recurse -Force
     $configDir = Join-Path $profile 'AppData\Local\Muti Session Dashboard\Config'
     New-DirectoryIfMissing -Path $configDir
-    Set-UserSunshineConfig -Username $Username -Port (Get-AllocatedPort -Username $Username -Reserve:$false)
+
+    # The loopback address is reserved permanently (unlike the port, which is
+    # only tentatively previewed for a brand-new user and actually
+    # reserved/released per Start/Stop cycle): Moonlight pairs per-host, so
+    # giving a user a stable address avoids forcing a re-pair every session.
+    $loopback = Get-AllocatedLoopback -Username $Username -Reserve
+    $port = Get-AllocatedPort -Username $Username -Reserve:$ReservePort -Loopback $loopback
+    Set-UserSunshineConfig -Username $Username -Port $port -Loopback $loopback
+    New-UserSunshineAppsConfig -Username $Username
+    Set-UserSunshineAutoStart -Username $Username
+
+    return [pscustomobject]@{ Username = $Username; Port = $port; Loopback = $loopback }
+}
+
+function Initialize-UserSunshine {
+    param([Parameter(Mandatory)][string]$Username)
+    Install-UserSunshineFiles -Username $Username -ReservePort:$false | Out-Null
+}
+
+function Update-DashboardUserSunshine {
+    <#
+        Installs/updates Sunshine for an already-created dashboard user --
+        e.g. after Install-SunshinePortable has pulled a newer release into
+        the master copy, this pushes it out to an existing user without
+        recreating their Windows account. Re-copies the executable/assets
+        and refreshes sunshine.conf/the Startup-folder shortcut; apps.json
+        is left alone if it already exists, so an operator's own app-list
+        customization survives an update.
+    #>
+    param([Parameter(Mandatory)][string]$Username)
+    Assert-Administrator
+
+    $knownUsers = @(Get-RemoteDesktopUsers | ForEach-Object { $_.Username })
+    if ($knownUsers -notcontains $Username) {
+        throw "'$Username' is not a member of the local 'Remote Desktop Users' group. Create the user first."
+    }
+
+    $result = Install-UserSunshineFiles -Username $Username -ReservePort
+
+    $versions = Get-ComponentVersions
+    $sunshineVersion = if ($versions.ContainsKey('Sunshine')) { $versions['Sunshine'].Version } else { 'unknown' }
+    Write-Host "Sunshine updated for '$Username' (release $sunshineVersion, port $($result.Port), loopback $($result.Loopback))."
+    return $result
 }
 
 function Get-AllocatedPort {
-    param([Parameter(Mandatory)][string]$Username, [switch]$Reserve)
+    <#
+        Sunshine's 'port' is the base of a fixed *family* of ports (see the
+        $script:SunshinePortOffsets table), not a single port -- e.g. two
+        users whose base ports are only 1 apart collide, because the first
+        user's Web port (base+1) lands on the second user's HTTP port
+        (base+0). Every offset is checked against real listeners, not just
+        the bare base value, or "no collision on the base port" would be a
+        false negative.
+
+        Each user's own loopback address (bind_address, see
+        Get-AllocatedLoopback) already isolates its whole port family from
+        every other dashboard-managed user -- a listening socket is
+        (address, port), not port alone -- so pass -Loopback once it's known
+        for a check that also catches something else already listening on
+        that specific address, on top of the shared-address check below.
+    #>
+    param([Parameter(Mandatory)][string]$Username, [switch]$Reserve, [string]$Loopback)
     $state = Get-DashboardState
     if ($state.ContainsKey($Username) -and $state[$Username].SunshinePort) { return [int]$state[$Username].SunshinePort }
     $used = @($state.Values | ForEach-Object { if ($_.SunshinePort) { [int]$_.SunshinePort } })
+
+    $addresses = @('0.0.0.0', '127.0.0.1', '::', '::1')
+    if (-not [string]::IsNullOrWhiteSpace($Loopback)) { $addresses += $Loopback }
+
     foreach ($port in $script:PortStart..$script:PortEnd) {
         if ($used -contains $port) { continue }
-        # Never probe 127.0.0.1 with Test-NetConnection. If a local process is
-        # already listening, Get-NetTCPConnection can identify the collision
-        # without opening a connection or waiting for a response.
-        $listener = Get-NetTCPConnection -LocalAddress '0.0.0.0','127.0.0.1','::','::1' -LocalPort $port -State Listen -ErrorAction SilentlyContinue
-        if ($null -ne $listener) { continue }
+
+        $collision = $false
+        foreach ($name in $script:SunshinePortOffsets.Keys) {
+            $candidate = $port + $script:SunshinePortOffsets[$name]
+            if ($candidate -lt 1 -or $candidate -gt 65535) { continue }
+            # Never probe with Test-NetConnection. Get-NetTCPConnection /
+            # Get-NetUDPEndpoint identify an existing listener without
+            # opening a connection or waiting for a response.
+            if ($script:SunshineUdpPortNames -contains $name) {
+                $listener = Get-NetUDPEndpoint -LocalAddress $addresses -LocalPort $candidate -ErrorAction SilentlyContinue
+            } else {
+                $listener = Get-NetTCPConnection -LocalAddress $addresses -LocalPort $candidate -State Listen -ErrorAction SilentlyContinue
+            }
+            if ($null -ne $listener) { $collision = $true; break }
+        }
+        if ($collision) { continue }
+
         if ($Reserve) {
-            $state[$Username] = @{ Username=$Username; SunshinePort=$port; SessionState='Stopped'; SunshineState='Stopped'; RdpSessionId=$null; RdpConnectionStatus='Disconnected' }
+            if ($state.ContainsKey($Username)) {
+                # Update in place -- replacing the whole entry here would
+                # clobber fields (RdpSessionId, SunshineLoopback, ...) an
+                # existing user already had recorded.
+                $state[$Username].SunshinePort = $port
+            } else {
+                $state[$Username] = @{ Username=$Username; AccountName=".\$Username"; SunshinePort=$port; SunshineLoopback=$null; SessionState='Stopped'; SunshineState='Stopped'; RdpSessionId=$null; RdpConnectionStatus='Disconnected'; SunshineProcessId=$null }
+            }
             Save-DashboardState -State $state
         }
         return $port
@@ -695,18 +864,151 @@ function Get-AllocatedPort {
     throw 'No available Sunshine ports remain.'
 }
 
+function Get-AllocatedLoopback {
+    <#
+        Assigns each dashboard-managed user a distinct loopback address
+        (127.0.0.3, 127.0.0.4, ...) that Sunshine binds to via bind_address.
+        Windows treats the entire 127.0.0.0/8 block as loopback with no
+        extra routing/firewall configuration needed -- the same property
+        Invoke-DashboardRdpBootstrap already relies on for 127.0.0.2.
+
+        This exists because moonlight-qt has no supported way to target a
+        non-default Sunshine port from its command line (confirmed against
+        its own command-line parser source: getHost() never parses a port
+        out of the host argument), so per-user *ports* alone (Get-AllocatedPort)
+        can't be reached by Connect-DashboardMoonlight. A distinct address per
+        user, each answering on Sunshine's default GameStream ports, is what
+        actually makes every user's stream independently reachable.
+    #>
+    param([Parameter(Mandatory)][string]$Username, [switch]$Reserve)
+    $state = Get-DashboardState
+    if ($state.ContainsKey($Username) -and $state[$Username].SunshineLoopback) { return [string]$state[$Username].SunshineLoopback }
+
+    $used = @($state.Values | ForEach-Object { if ($_.SunshineLoopback) { [string]$_.SunshineLoopback } })
+    for ($octet = $script:SunshineLoopbackStartOctet; $octet -le 254; $octet++) {
+        $address = "127.0.0.$octet"
+        if ($used -contains $address) { continue }
+        if ($Reserve) {
+            if ($state.ContainsKey($Username)) {
+                $state[$Username].SunshineLoopback = $address
+            } else {
+                $state[$Username] = @{ Username=$Username; AccountName=".\$Username"; SunshinePort=$null; SunshineLoopback=$address; SessionState='Stopped'; SunshineState='Stopped'; RdpSessionId=$null; RdpConnectionStatus='Disconnected'; SunshineProcessId=$null }
+            }
+            Save-DashboardState -State $state
+        }
+        return $address
+    }
+    throw 'No available Sunshine loopback addresses remain.'
+}
+
 function Set-UserSunshineConfig {
-    param([Parameter(Mandatory)][string]$Username, [Parameter(Mandatory)][int]$Port)
+    param(
+        [Parameter(Mandatory)][string]$Username,
+        [Parameter(Mandatory)][int]$Port,
+        [Parameter(Mandatory)][string]$Loopback
+    )
     $configDir = Join-Path (Join-Path 'C:\Users' $Username) 'AppData\Local\Muti Session Dashboard\Config'
     New-DirectoryIfMissing -Path $configDir
+    $appsFile = Join-Path $configDir 'apps.json'
     $content = @(
-        "# Generated by Multi Session Dashboard",
+        '# Generated by Multi Session Dashboard',
         "port = $Port",
+        "bind_address = $Loopback",
+        "sunshine_name = $Username",
         'origin_web_ui_allowed = lan',
         'upnp = disabled',
-        'global_prep_cmd = []'
+        'global_prep_cmd = []',
+        "file_apps = $appsFile",
+        "log_path = $(Join-Path $configDir 'sunshine.log')",
+        "credentials_file = $(Join-Path $configDir 'sunshine_state.json')",
+        "pkey = $(Join-Path $configDir 'credentials\cakey.pem')",
+        "cert = $(Join-Path $configDir 'credentials\cacert.pem')"
     ) -join "`r`n"
     Set-Content -LiteralPath (Join-Path $configDir 'sunshine.conf') -Value $content -Encoding UTF8
+}
+
+function New-UserSunshineAppsConfig {
+    <#
+        Writes a minimal per-user apps.json (Sunshine's list of streamable
+        apps/desktops) with a single "Desktop" entry, matching the app name
+        Connect-DashboardMoonlight passes to `moonlight stream <host> <app>`.
+        Never overwrites an operator's own customization on repeat runs.
+    #>
+    param([Parameter(Mandatory)][string]$Username)
+    $configDir = Join-Path (Join-Path 'C:\Users' $Username) 'AppData\Local\Muti Session Dashboard\Config'
+    New-DirectoryIfMissing -Path $configDir
+    $appsFile = Join-Path $configDir 'apps.json'
+    if (Test-Path -LiteralPath $appsFile) { return }
+    $apps = [ordered]@{ apps = @(@{ name = 'Desktop'; 'image-path' = 'desktop.png' }) }
+    $apps | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $appsFile -Encoding UTF8
+}
+
+function Set-UserSunshineAutoStart {
+    <#
+        Creates a Startup-folder shortcut so Sunshine launches automatically
+        at this user's own interactive logon -- running as that user, not as
+        the elevated dashboard/operator account a Start-Process call from the
+        dashboard would otherwise run it under. See Test-UserSunshineRunning
+        for the verification this is paired with, and Start-DashboardSession
+        for how the two are used together.
+    #>
+    param([Parameter(Mandatory)][string]$Username)
+    $profile = Join-Path 'C:\Users' $Username
+    $sunshine = Join-Path $profile 'AppData\Local\Muti Session Dashboard\Sunshine\sunshine.exe'
+    $conf = Join-Path $profile 'AppData\Local\Muti Session Dashboard\Config\sunshine.conf'
+    $startupDir = Join-Path $profile 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup'
+    New-DirectoryIfMissing -Path $startupDir
+    $shortcutPath = Join-Path $startupDir 'Sunshine.lnk'
+
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($shortcutPath)
+    $shortcut.TargetPath = $sunshine
+    $shortcut.Arguments = "`"$conf`""
+    $shortcut.WorkingDirectory = Split-Path -Parent $sunshine
+    $shortcut.WindowStyle = 7 # minimized
+    $shortcut.Description = "Multi Session Dashboard: auto-start Sunshine for $Username"
+    $shortcut.Save()
+}
+
+function Test-UserSunshineRunning {
+    <#
+        The real per-user verification the spec requires: do not report
+        Sunshine as running just because a process was launched. Confirms a
+        sunshine.exe process is both the one under this user's own per-user
+        copy AND actually owned by that Windows user (not SYSTEM,
+        Administrator, or the dashboard's own account), and that its
+        assigned loopback address/port is listening.
+    #>
+    param([Parameter(Mandatory)][string]$Username)
+
+    $expectedPath = Join-Path (Join-Path 'C:\Users' $Username) 'AppData\Local\Muti Session Dashboard\Sunshine\sunshine.exe'
+    $result = [pscustomobject]@{ Running = $false; ProcessId = $null; Owner = $null; PortListening = $false }
+
+    $processes = @(Get-CimInstance -ClassName Win32_Process -Filter "Name='sunshine.exe'" -ErrorAction SilentlyContinue)
+    foreach ($process in $processes) {
+        if ($process.ExecutablePath -and $process.ExecutablePath -ieq $expectedPath) {
+            $ownerInfo = Invoke-CimMethod -InputObject $process -MethodName GetOwner -ErrorAction SilentlyContinue
+            $owner = if ($ownerInfo) { [string]$ownerInfo.User } else { $null }
+            if ($owner -ieq $Username) {
+                $result.Running = $true
+                $result.ProcessId = [int]$process.ProcessId
+                $result.Owner = $owner
+                break
+            }
+        }
+    }
+
+    if ($result.Running) {
+        $state = Get-DashboardState
+        $port = if ($state.ContainsKey($Username)) { $state[$Username].SunshinePort } else { $null }
+        $loopback = if ($state.ContainsKey($Username)) { $state[$Username].SunshineLoopback } else { $null }
+        if ($port -and $loopback) {
+            $listener = Get-NetTCPConnection -LocalAddress $loopback -LocalPort ([int]$port) -State Listen -ErrorAction SilentlyContinue
+            $result.PortListening = ($null -ne $listener)
+        }
+    }
+
+    return $result
 }
 
 function Start-DashboardSession {
@@ -714,9 +1016,30 @@ function Start-DashboardSession {
     Assert-Administrator
     if (-not (Test-TsconAvailable)) { throw 'Windows tscon.exe is required but was not found.' }
 
-    # 1) Create a real 1920x1080 RDP login for the selected user using native mstsc,
-    #    against the per-user RDP alias with the saved Windows credential.
-    $rdpSession = Invoke-DashboardRdpBootstrap -Username $Username
+    # 0) Validate preconditions before attempting anything: known user -> RDP
+    #    Wrapper healthy -> per-user Sunshine installed. Failing fast here
+    #    avoids a confusing partial failure deep inside the RDP bootstrap.
+    $knownUsers = @(Get-RemoteDesktopUsers | ForEach-Object { $_.Username })
+    if ($knownUsers -notcontains $Username) {
+        throw "'$Username' is not a member of the local 'Remote Desktop Users' group."
+    }
+    $wrapperCheck = Test-RdpWrapperConfiguration
+    if (-not $wrapperCheck.Success) {
+        throw "RDP Wrapper is not correctly configured: $($wrapperCheck.Failures -join ', ')"
+    }
+    $sunshineExe = Join-Path (Join-Path 'C:\Users' $Username) 'AppData\Local\Muti Session Dashboard\Sunshine\sunshine.exe'
+    if (-not (Test-Path -LiteralPath $sunshineExe)) {
+        throw "Sunshine is not installed for '$Username'. Create the user through the dashboard so Initialize-UserSunshine can run first."
+    }
+
+    # 1) Create a real 1920x1080 RDP login for the selected user via Remote
+    #    Desktop Plus. If this doesn't produce an Active RDP session in time,
+    #    fail cleanly here -- tscon hand-off is never attempted.
+    try {
+        $rdpSession = Invoke-DashboardRdpBootstrap -Username $Username
+    } catch {
+        throw "RDP session was not created. TSCON hand-off was not attempted. $($_.Exception.Message)"
+    }
 
     # 2) Hand the RDP session to the local console so the Windows session survives.
     Invoke-TsconToConsole -SessionId $rdpSession.SessionId
@@ -728,18 +1051,32 @@ function Start-DashboardSession {
         throw "RDP session for '$Username' was handed off with tscon, but the user is not reported Active by Windows."
     }
 
-    # 4) Start Sunshine only after the Windows user session is online.
-    $port = Get-AllocatedPort -Username $Username -Reserve
-    Set-UserSunshineConfig -Username $Username -Port $port
-    $sunshine = Join-Path (Join-Path 'C:\Users' $Username) 'AppData\Local\Muti Session Dashboard\Sunshine\Sunshine.exe'
-    $conf = Join-Path (Join-Path 'C:\Users' $Username) 'AppData\Local\Muti Session Dashboard\Config\sunshine.conf'
-    Start-Process -FilePath $sunshine -ArgumentList @($conf) -LoadUserProfile | Out-Null
+    # 4) Sunshine auto-starts under the user's own identity via the Startup-
+    #    folder shortcut created at user-creation time (Set-UserSunshineAutoStart)
+    #    -- it is deliberately never Start-Process'd from here, since that
+    #    would run it as the elevated dashboard/operator account instead of
+    #    the target user. Poll for the real, verified state instead of
+    #    trusting that launching it worked.
+    $loopback = Get-AllocatedLoopback -Username $Username -Reserve
+    $port = Get-AllocatedPort -Username $Username -Reserve -Loopback $loopback
+    Set-UserSunshineConfig -Username $Username -Port $port -Loopback $loopback
+
+    $deadline = (Get-Date).AddSeconds(20)
+    $sunshineStatus = Test-UserSunshineRunning -Username $Username
+    while (-not $sunshineStatus.Running -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 500
+        $sunshineStatus = Test-UserSunshineRunning -Username $Username
+    }
+    if (-not $sunshineStatus.Running) {
+        throw "Sunshine did not start under '$Username' within 20 seconds. Check the Startup-folder entry (AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\Sunshine.lnk) and Group Policy for that user; Sunshine is intentionally never launched under the dashboard's own account."
+    }
 
     $state = Get-DashboardState
     $state[$Username].RdpSessionId = $online.SessionId
     $state[$Username].RdpConnectionStatus = 'Online'
     $state[$Username].SessionState = 'Running'
     $state[$Username].SunshineState = 'Running'
+    $state[$Username].SunshineProcessId = $sunshineStatus.ProcessId
     Save-DashboardState -State $state
     return $online
 }
@@ -781,7 +1118,22 @@ function Connect-DashboardMoonlight {
     param([Parameter(Mandatory)][string]$Username)
     $moonlight = Join-Path $script:InstallRoot 'Stream\Moonlight\Moonlight.exe'
     if (-not (Test-Path -LiteralPath $moonlight)) { throw 'Moonlight.exe is missing.' }
-    Start-Process -FilePath $moonlight -ArgumentList @('--display-mode','windowed','--resolution','1920x1080')
+
+    $state = Get-DashboardState
+    if (-not $state.ContainsKey($Username) -or [string]::IsNullOrWhiteSpace([string]$state[$Username].SunshineLoopback)) {
+        throw "No Sunshine target is assigned for '$Username' yet. Create the user (or run Start) before Connect Moonlight."
+    }
+    $loopback = [string]$state[$Username].SunshineLoopback
+
+    # moonlight-qt's CLI has no supported way to target a non-default
+    # Sunshine port (confirmed against its command-line parser source), so
+    # each user gets its own loopback address instead (Get-AllocatedLoopback)
+    # and Sunshine always answers there on its default GameStream ports.
+    # 'stream <host> <app>' and '--absolute-mouse' (backing "optimize mouse
+    # for remote desktop instead of games") are real StreamCommandLineParser
+    # options, not flags this dashboard invented.
+    $arguments = @('stream', $loopback, 'Desktop', '--display-mode', 'windowed', '--resolution', '1920x1080', '--absolute-mouse')
+    Start-Process -FilePath $moonlight -ArgumentList $arguments | Out-Null
 }
 
 function Stop-DashboardSession {
@@ -795,7 +1147,17 @@ function Stop-DashboardSession {
     else { logoff $Username 2>$null }
 
     $state = Get-DashboardState
-    if ($state.ContainsKey($Username)) { $state[$Username].SunshinePort = $null; $state[$Username].SessionState='Stopped'; $state[$Username].SunshineState='Stopped'; $state[$Username].RdpConnectionStatus='Disconnected'; Save-DashboardState -State $state }
+    if ($state.ContainsKey($Username)) {
+        # SunshineLoopback is intentionally left in place: it's a stable
+        # per-user identity (Moonlight pairs per-host), unlike the port,
+        # which is freely re-allocated on the next Start.
+        $state[$Username].SunshinePort = $null
+        $state[$Username].SessionState = 'Stopped'
+        $state[$Username].SunshineState = 'Stopped'
+        $state[$Username].RdpConnectionStatus = 'Disconnected'
+        $state[$Username].SunshineProcessId = $null
+        Save-DashboardState -State $state
+    }
 }
 
 function Test-DashboardInstallation {
@@ -806,7 +1168,7 @@ function Test-DashboardInstallation {
         'Moonlight downloaded' = (Test-Path -LiteralPath (Join-Path $script:InstallRoot 'Stream\Moonlight\Moonlight.exe'))
         'Sunshine downloaded' = (Test-Path -LiteralPath (Join-Path $script:InstallRoot 'Stream\Sunshine\Sunshine.exe'))
         'tscon available' = (Test-TsconAvailable)
-        'Remote Desktop Plus installed' = (Test-Path -LiteralPath $script:RdpPlusPath)
+        'Remote Desktop Plus installed' = (Test-Path -LiteralPath (Resolve-RemoteDesktopPlusPath))
         'Dashboard installed' = (Test-Path -LiteralPath (Join-Path $script:InstallRoot 'Dashboard.ps1'))
     }
     $checks.GetEnumerator() | ForEach-Object { [pscustomobject]@{ Check=$_.Key; Passed=[bool]$_.Value } }
