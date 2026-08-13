@@ -9,8 +9,13 @@
         irm https://raw.githubusercontent.com/Chr0mX/Muti-Session-Dashboard/main/install.ps1 | iex
 
     The same command works for both a first-time install and an update: it
-    always downloads the latest scripts and dependency releases and re-runs
-    the (idempotent) installer, overwriting the previous installation.
+    always re-runs the (idempotent) installer over the existing
+    installation. Dependency downloads are still cached and reused when
+    nothing changed -- RDP Wrapper, Moonlight, and Sunshine are all resolved
+    through their GitHub releases API and cached by the resolved release
+    tag, so a re-run only re-downloads a dependency when its upstream
+    release actually changed, not on every run. Pass -RefreshDownloadCache
+    to force a full re-download regardless.
 
     When piped through `irm | iex`, $PSScriptRoot is empty and there is no
     local checkout to load MultiSessionDashboard.psm1/Dashboard.ps1 from, so
@@ -22,7 +27,11 @@
 param(
     [string]$RepoRawBaseUri = 'https://raw.githubusercontent.com/Chr0mX/Muti-Session-Dashboard/main/scripts',
     [string]$InstallRoot = 'C:\Program Files\Muti Session Dashboard',
-    [string]$RdpWrapperUri = 'https://github.com/sergiye/rdpWrapper/releases/latest/download/rdpWrapper_x64.exe',
+    # Empty by default so Install-RdpWrapper resolves the latest release
+    # through the GitHub API instead of a static 'latest/download' URL.
+    [string]$RdpWrapperUri = '',
+    [string]$RdpWrapperReleaseApiUri = 'https://api.github.com/repos/sergiye/rdpWrapper/releases/latest',
+    [string[]]$RdpWrapperAssetNamePatterns = @('(?i)^rdpWrapper_x64\.exe$', '(?i)^rdpWrapper.*x64.*\.exe$', '(?i)^rdpWrapper.*\.zip$'),
     [string[]]$RdpWrapperInstallArguments = @('-install'),
     [int]$RdpWrapperInstallTimeoutSeconds = 600,
     [string]$MoonlightReleaseApiUri = 'https://api.github.com/repos/moonlight-stream/moonlight-qt/releases/latest',
@@ -30,7 +39,8 @@ param(
     [string]$SunshineReleaseApiUri = 'https://api.github.com/repos/LizardByte/Sunshine/releases/latest',
     [string[]]$SunshineAssetNamePatterns = @('(?i)^sunshine-windows-portable\.zip$', '(?i)^sunshine-windows.*portable.*\.zip$', '(?i)^sunshine.*windows.*portable.*\.zip$', '(?i)^sunshine.*portable.*windows.*\.zip$'),
     [string]$RemoteDesktopPlusUri = 'https://www.donkz.nl/download/remote-desktop-plus-msi/',
-    [int]$RemoteDesktopPlusInstallTimeoutSeconds = 300
+    [int]$RemoteDesktopPlusInstallTimeoutSeconds = 300,
+    [switch]$RefreshDownloadCache
 )
 
 $ErrorActionPreference = 'Stop'
