@@ -50,9 +50,6 @@ foreach ($column in @(
     @{ Name='RdpHostPort'; Header='RDP Endpoint'; Width=150 },
     @{ Name='RdpSessionId'; Header='RDP Session'; Width=90 },
     @{ Name='SessionState'; Header='Session'; Width=100 },
-    @{ Name='SunshineState'; Header='Sunshine'; Width=100 },
-    @{ Name='SunshinePort'; Header='Sunshine Port'; Width=100 },
-    @{ Name='SunshineLoopback'; Header='Moonlight Host'; Width=110 },
     @{ Name='RdpConnectionStatus'; Header='RDP Status'; Width=130 }
 )) {
     $columnObject = New-Object Windows.Forms.DataGridViewTextBoxColumn
@@ -116,14 +113,11 @@ function Refresh-Grid {
             $grid.Rows[$row].Cells['RdpHostPort'].Value = $endpoint
             $grid.Rows[$row].Cells['RdpSessionId'].Value = $entry.RdpSessionId
             $grid.Rows[$row].Cells['SessionState'].Value = $entry.SessionState
-            $grid.Rows[$row].Cells['SunshineState'].Value = $entry.SunshineState
-            $grid.Rows[$row].Cells['SunshinePort'].Value = $entry.SunshinePort
-            $grid.Rows[$row].Cells['SunshineLoopback'].Value = $entry.SunshineLoopback
             $grid.Rows[$row].Cells['RdpConnectionStatus'].Value = $entry.RdpConnectionStatus
         }
 
         Save-DashboardState -State $state
-        Set-Status ("Detected {0} user(s) in 'Remote Desktop Users'. Select a row to Start/Connect." -f $users.Count)
+        Set-Status ("Detected {0} user(s) in 'Remote Desktop Users'. Select a row to Connect RDP." -f $users.Count)
     } catch {
         $grid.Rows.Clear()
         Set-Status ("User list failed: {0}" -f $_.Exception.Message)
@@ -131,19 +125,21 @@ function Refresh-Grid {
 }
 
 function Update-SessionMonitor {
-    # Invoke-DashboardAction's Wait-DashboardRdpSession/Test-UserSunshineRunning
-    # polling loops pump the WinForms message loop internally so the window
-    # stays responsive, which means this timer's own Tick can fire while an
-    # action is still mid-flight. Skip this tick rather than let it read/write
-    # sessions.json concurrently with the in-flight action's own state calls.
+    # Invoke-DashboardAction's Wait-DashboardRdpSession polling pumps the
+    # WinForms message loop internally so the window stays responsive, which
+    # means this timer's own Tick can fire while an action is still
+    # mid-flight. Skip this tick rather than let it read/write sessions.json
+    # concurrently with the in-flight action's own state calls.
     if ($script:DashboardActionInProgress) { return }
     try {
         $state = Get-DashboardState
 
-        # Poll every Remote Desktop Users member's actual Windows session state,
-        # not just the ones the dashboard itself started. This is what makes a
-        # manual RDP connection (outside the dashboard) show up correctly, and
-        # it keeps tscon handoff working for those sessions too.
+        # Poll every Remote Desktop Users member's actual Windows session
+        # state, not just the ones the dashboard itself connected -- this is
+        # what makes a manual RDP connection (outside the dashboard) show up
+        # correctly too. Purely a status reflection: nothing here acts on
+        # the session (no console hand-off), each user just keeps their own
+        # ordinary RDP session, reconnecting to it the normal way.
         $users = @(Get-RemoteDesktopUsers)
         foreach ($user in $users) {
             $key = [string]$user.Username
@@ -152,25 +148,17 @@ function Update-SessionMonitor {
                 $state[$key] = Get-DefaultDashboardStateEntry -Username $key -AccountName $user.AccountName
             }
             $entry = $state[$key]
-            $hasWindowsSession = $false
 
             try {
-                $session = Maintain-DashboardSession -Username $key
+                $session = Get-UserSession -Username $key
                 if ($null -eq $session) {
                     $entry.RdpSessionId = $null
                     $entry.RdpConnectionStatus = 'Disconnected'
                     if ($entry.SessionState -eq 'Running') { $entry.SessionState = 'Stopped' }
                 } else {
-                    $hasWindowsSession = $true
                     $entry.RdpSessionId = $session.SessionId
-                    if ($session.IsRdp -and $session.Online) {
-                        # A live RDP reconnect is intentionally left alone so the
-                        # operator can use the GUI. tscon is only applied after the
-                        # RDP client disconnects.
+                    if ($session.Online) {
                         $entry.RdpConnectionStatus = 'Connected'
-                        $entry.SessionState = 'Running'
-                    } elseif ($session.IsConsole -and $session.Online) {
-                        $entry.RdpConnectionStatus = 'Online'
                         $entry.SessionState = 'Running'
                     } else {
                         $entry.RdpConnectionStatus = 'Disconnected'
@@ -178,30 +166,8 @@ function Update-SessionMonitor {
                 }
             } catch {
                 # Keep the dashboard alive even if a single user's session
-                # temporarily cannot be queried or handed off.
+                # temporarily cannot be queried.
                 $entry.RdpConnectionStatus = 'Error'
-            }
-
-            # Never trust the flag Start/Stop last set: re-derive SunshineState
-            # from the actual process/owner/port every tick, same as the RDP
-            # status above. Skip the check entirely when there's no Windows
-            # session at all -- nothing meaningful can be running.
-            if ($hasWindowsSession) {
-                try {
-                    $sunshineStatus = Test-UserSunshineRunning -Username $key
-                    if ($sunshineStatus.Running) {
-                        $entry.SunshineState = 'Running'
-                        $entry.SunshineProcessId = $sunshineStatus.ProcessId
-                    } else {
-                        $entry.SunshineState = 'Stopped'
-                        $entry.SunshineProcessId = $null
-                    }
-                } catch {
-                    $entry.SunshineState = 'Error'
-                }
-            } elseif ($entry.SunshineState -ne 'Stopped') {
-                $entry.SunshineState = 'Stopped'
-                $entry.SunshineProcessId = $null
             }
         }
         Save-DashboardState -State $state
@@ -212,9 +178,6 @@ function Update-SessionMonitor {
             $entry = $state[$name]
             $row.Cells['RdpSessionId'].Value = $entry.RdpSessionId
             $row.Cells['SessionState'].Value = $entry.SessionState
-            $row.Cells['SunshineState'].Value = $entry.SunshineState
-            $row.Cells['SunshinePort'].Value = $entry.SunshinePort
-            $row.Cells['SunshineLoopback'].Value = $entry.SunshineLoopback
             $row.Cells['RdpConnectionStatus'].Value = $entry.RdpConnectionStatus
         }
     } catch {
@@ -223,14 +186,14 @@ function Update-SessionMonitor {
 }
 
 function Invoke-DashboardAction([scriptblock]$Action, [string]$Success) {
-    # Start/Connect RDP/Update Sunshine can block for tens of seconds inside
-    # $Action (Wait-DashboardRdpSession / Test-UserSunshineRunning polling),
-    # which now pump the WinForms message loop internally (Invoke-DashboardUiPump)
-    # so the window doesn't appear to hang. Pumping means input messages -
-    # including another button's click - CAN be processed while $Action is
-    # still running, so disable every action button here to make that
-    # reentrant click a no-op instead of a second action racing the first.
-    $actionButtons = @($create, $start, $rdp, $moonlight, $stop, $refresh, $updateSunshine)
+    # Connect RDP can block for tens of seconds inside $Action
+    # (Wait-DashboardRdpSession polling), which pumps the WinForms message
+    # loop internally (Invoke-DashboardUiPump) so the window doesn't appear
+    # to hang. Pumping means input messages - including another button's
+    # click - CAN be processed while $Action is still running, so disable
+    # every action button here to make that reentrant click a no-op instead
+    # of a second action racing the first.
+    $actionButtons = @($create, $rdp, $stop, $refresh)
     foreach ($button in $actionButtons) { $button.Enabled = $false }
     $script:DashboardActionInProgress = $true
     $form.Refresh()
@@ -276,50 +239,17 @@ $form.Controls.Add($create)
 
 
 
-$start = New-Object Windows.Forms.Button
-
-$start.Text = 'Start'
-
-$start.Location = New-Object Drawing.Point(155, 370)
-
-$start.Size = New-Object Drawing.Size(110, 36)
-
-$start.Add_Click({
-    Invoke-DashboardAction {
-        $username = Get-SelectedUsername
-        Start-DashboardSession -Username $username
-    } 'Session running'
-})
-
-$form.Controls.Add($start)
-
-
-
 $rdp = New-Object Windows.Forms.Button
 
 $rdp.Text = 'Connect RDP'
 
-$rdp.Location = New-Object Drawing.Point(278, 370)
+$rdp.Location = New-Object Drawing.Point(155, 370)
 
 $rdp.Size = New-Object Drawing.Size(130, 36)
 
-$rdp.Add_Click({ Invoke-DashboardAction { Connect-DashboardRdp -Username (Get-SelectedUsername) } 'RDP reconnect requested' })
+$rdp.Add_Click({ Invoke-DashboardAction { Connect-DashboardRdp -Username (Get-SelectedUsername) } 'RDP connected' })
 
 $form.Controls.Add($rdp)
-
-
-
-$moonlight = New-Object Windows.Forms.Button
-
-$moonlight.Text = 'Connect Moonlight'
-
-$moonlight.Location = New-Object Drawing.Point(421, 370)
-
-$moonlight.Size = New-Object Drawing.Size(160, 36)
-
-$moonlight.Add_Click({ Invoke-DashboardAction { Connect-DashboardMoonlight -Username (Get-SelectedUsername) } 'Moonlight launched' })
-
-$form.Controls.Add($moonlight)
 
 
 
@@ -327,7 +257,7 @@ $stop = New-Object Windows.Forms.Button
 
 $stop.Text = 'Stop'
 
-$stop.Location = New-Object Drawing.Point(594, 370)
+$stop.Location = New-Object Drawing.Point(298, 370)
 
 $stop.Size = New-Object Drawing.Size(110, 36)
 
@@ -341,7 +271,7 @@ $refresh = New-Object Windows.Forms.Button
 
 $refresh.Text = 'Refresh'
 
-$refresh.Location = New-Object Drawing.Point(717, 370)
+$refresh.Location = New-Object Drawing.Point(421, 370)
 
 $refresh.Size = New-Object Drawing.Size(110, 36)
 
@@ -351,24 +281,9 @@ $form.Controls.Add($refresh)
 
 
 
-$updateSunshine = New-Object Windows.Forms.Button
-
-$updateSunshine.Text = 'Update Sunshine'
-
-$updateSunshine.Location = New-Object Drawing.Point(840, 370)
-
-$updateSunshine.Size = New-Object Drawing.Size(140, 36)
-
-$updateSunshine.Add_Click({ Invoke-DashboardAction { Update-DashboardUserSunshine -Username (Get-SelectedUsername) } 'Sunshine updated' })
-
-$form.Controls.Add($updateSunshine)
-
-
-
-# Poll Windows sessions continuously. This makes tscon a lifecycle handoff:
-# Start -> RDP login -> tscon to console; Connect RDP -> GUI remains connected;
-# when the RDP client disconnects, the monitor detects the disconnected RDP
-# session and tscon hands it back to console so the Windows session stays alive.
+# Poll Windows sessions continuously so the grid reflects real state,
+# including RDP connections made outside the dashboard (e.g. a manual
+# mstsc/rdp.exe connection) -- pure status reflection, no session hand-off.
 $sessionTimer = New-Object Windows.Forms.Timer
 $sessionTimer.Interval = 2000
 $sessionTimer.Add_Tick({ Update-SessionMonitor })
@@ -377,4 +292,3 @@ $sessionTimer.Start()
 Refresh-Grid
 
 [void]$form.ShowDialog()
-

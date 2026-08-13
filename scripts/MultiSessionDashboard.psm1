@@ -6,31 +6,12 @@ $script:ConfigRoot = Join-Path $script:InstallRoot 'Config'
 $script:UsersRoot = Join-Path $script:InstallRoot 'Users'
 $script:StateFile = Join-Path $script:ConfigRoot 'sessions.json'
 $script:DownloadCacheRoot = Join-Path $script:ConfigRoot 'Downloads'
-$script:PortStart = 47989
-$script:PortEnd = 48050
+# RDP Wrapper's concurrent multi-session support is more reliable connecting
+# through a distinct loopback address than through 127.0.0.1 -- this is kept
+# regardless of whether a session ever touches the console.
 $script:RdpHost = '127.0.0.2'
 $script:RdpPort = 3389
 $script:RdpPlusPath = 'C:\Program Files (x86)\Remote Desktop Plus\rdp.exe'
-$script:ComponentVersionsFile = Join-Path $script:ConfigRoot 'component-versions.json'
-# .1 is the host and .2 is reserved by the RDP Wrapper session-handoff trick
-# (see Invoke-DashboardRdpBootstrap), so per-user Sunshine loopback addresses
-# start at .3. See Get-AllocatedLoopback.
-$script:SunshineLoopbackStartOctet = 3
-
-# Sunshine's 'port' config value is the base of a fixed *family* of ports,
-# each offset from it by a documented, unconfigurable amount -- not a single
-# port. See https://docs.lizardbyte.dev/projects/sunshine/master/md_docs_2configuration.html
-$script:SunshinePortOffsets = [ordered]@{
-    Https   = -5  # TCP
-    Http    = 0   # TCP -- the configured 'port' value itself
-    Web     = 1   # TCP
-    Video   = 9   # UDP
-    Control = 10  # UDP
-    Audio   = 11  # UDP
-    Mic     = 13  # UDP (unused)
-    Rtsp    = 21  # TCP
-}
-$script:SunshineUdpPortNames = @('Video', 'Control', 'Audio', 'Mic')
 
 
 function Set-DashboardPaths {
@@ -40,7 +21,6 @@ function Set-DashboardPaths {
     $script:UsersRoot = Join-Path $script:InstallRoot 'Users'
     $script:StateFile = Join-Path $script:ConfigRoot 'sessions.json'
     $script:DownloadCacheRoot = Join-Path $script:ConfigRoot 'Downloads'
-    $script:ComponentVersionsFile = Join-Path $script:ConfigRoot 'component-versions.json'
 }
 
 function Assert-Administrator {
@@ -49,186 +29,6 @@ function Assert-Administrator {
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
         throw 'Multi Session Dashboard must be run from an elevated PowerShell session.'
     }
-}
-
-function Get-SeTcbPrivilegeSids {
-    <#
-        Reads the local security policy's current SeTcbPrivilege ("Act as
-        part of the operating system") assignment via secedit and returns
-        the raw SID/account list. Read-only; used both to check whether the
-        Administrators group already has it and, in Grant-DashboardTcbPrivilege,
-        to merge into rather than clobber whatever's already assigned.
-    #>
-    $exportPath = Join-Path $env:TEMP ("msd-secpol-export-" + [guid]::NewGuid().ToString('N') + '.inf')
-    try {
-        & secedit /export /cfg $exportPath /areas USER_RIGHTS | Out-Null
-        if (-not (Test-Path -LiteralPath $exportPath)) {
-            throw 'secedit /export did not produce a policy file.'
-        }
-        $line = Get-Content -LiteralPath $exportPath | Where-Object { $_ -match '^\s*SeTcbPrivilege\s*=' } | Select-Object -First 1
-        if (-not $line -or $line -notmatch '=\s*(.*)$') { return @() }
-        return @($matches[1] -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-    } finally {
-        Remove-Item -LiteralPath $exportPath -ErrorAction SilentlyContinue
-    }
-}
-
-function Test-DashboardTcbPrivilegeGranted {
-    <#
-        Policy-level check: does the local security policy grant
-        SeTcbPrivilege to BUILTIN\Administrators (S-1-5-32-544)? This can be
-        true while the *current* process's own token still lacks it -- see
-        Test-CurrentTokenHasTcbPrivilege for that, separate, check.
-    #>
-    return ((Get-SeTcbPrivilegeSids) -contains '*S-1-5-32-544')
-}
-
-function Test-CurrentTokenHasTcbPrivilege {
-    <#
-        Token-level check: does *this* process's own logon token carry
-        SeTcbPrivilege right now? Granting the policy only affects new logon
-        tokens, so an operator who was already logged in when the grant
-        happened needs to log off/on (or reboot) before tscon actually works
-        for them -- whoami /priv omits a privilege entirely (not merely
-        'Disabled') when the token doesn't hold it at all.
-
-        NOTE: this only confirms the privilege is *present* -- see
-        Enable-DashboardTcbPrivilege for whether it's actually usable, which
-        is a separate, additional requirement.
-    #>
-    $priv = & whoami /priv 2>$null
-    return (($priv -join "`n") -match '(?im)^SeTcbPrivilege\s')
-}
-
-function Enable-DashboardTcbPrivilege {
-    <#
-        Granting SeTcbPrivilege via local policy (Grant-DashboardTcbPrivilege)
-        only puts it on the token in the *Disabled* state -- confirmed by a
-        live whoami /priv showing exactly that after logging off/on following
-        the grant. Windows does not auto-enable privileges granted this way;
-        only a small fixed set (SeDebugPrivilege, SeImpersonatePrivilege, ...)
-        is enabled by default on an elevated Administrator token. A disabled
-        privilege the token holds cannot actually be used until something
-        calls AdjustTokenPrivileges to enable it, and there's no guarantee
-        tscon.exe's own implementation does that -- so this process enables
-        it on its own token here, right before invoking tscon; the enabled
-        state is inherited by tscon.exe as a child process.
-
-        Returns $true only if the privilege was both present and
-        successfully enabled (AdjustTokenPrivileges can report success while
-        silently not enabling everything requested -- ERROR_NOT_ALL_ASSIGNED
-        -- so the last Win32 error is checked too, not just the return value).
-    #>
-    if (-not ('MultiSessionDashboard.TokenPrivilege' -as [type])) {
-        Add-Type -Language CSharp -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-
-namespace MultiSessionDashboard {
-    [StructLayout(LayoutKind.Sequential)]
-    struct LUID { public uint LowPart; public int HighPart; }
-
-    [StructLayout(LayoutKind.Sequential)]
-    struct LUID_AND_ATTRIBUTES { public LUID Luid; public uint Attributes; }
-
-    [StructLayout(LayoutKind.Sequential)]
-    struct TOKEN_PRIVILEGES { public uint PrivilegeCount; public LUID_AND_ATTRIBUTES Privileges; }
-
-    public static class TokenPrivilege {
-        [DllImport("advapi32.dll", SetLastError = true)]
-        static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
-
-        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-        static extern bool LookupPrivilegeValueW(string lpSystemName, string lpName, out LUID lpLuid);
-
-        [DllImport("advapi32.dll", SetLastError = true)]
-        static extern bool AdjustTokenPrivileges(IntPtr TokenHandle, bool DisableAllPrivileges, ref TOKEN_PRIVILEGES NewState, uint BufferLength, IntPtr PreviousState, IntPtr ReturnLength);
-
-        [DllImport("kernel32.dll")]
-        static extern bool CloseHandle(IntPtr hObject);
-
-        const uint TOKEN_ADJUST_PRIVILEGES = 0x0020;
-        const uint TOKEN_QUERY = 0x0008;
-        const uint SE_PRIVILEGE_ENABLED = 0x0002;
-        const int ERROR_NOT_ALL_ASSIGNED = 1300;
-
-        public static bool EnablePrivilege(string privilege) {
-            IntPtr tokenHandle = IntPtr.Zero;
-            try {
-                if (!OpenProcessToken(System.Diagnostics.Process.GetCurrentProcess().Handle, TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, out tokenHandle)) {
-                    return false;
-                }
-                LUID luid;
-                if (!LookupPrivilegeValueW(null, privilege, out luid)) {
-                    return false;
-                }
-                TOKEN_PRIVILEGES tp = new TOKEN_PRIVILEGES();
-                tp.PrivilegeCount = 1;
-                tp.Privileges = new LUID_AND_ATTRIBUTES { Luid = luid, Attributes = SE_PRIVILEGE_ENABLED };
-                bool ok = AdjustTokenPrivileges(tokenHandle, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
-                int error = Marshal.GetLastWin32Error();
-                // AdjustTokenPrivileges can return true while silently not
-                // enabling everything requested -- only ERROR_SUCCESS (0)
-                // means the privilege actually got enabled.
-                return ok && error == 0;
-            } finally {
-                if (tokenHandle != IntPtr.Zero) { CloseHandle(tokenHandle); }
-            }
-        }
-    }
-}
-'@
-    }
-    return [MultiSessionDashboard.TokenPrivilege]::EnablePrivilege('SeTcbPrivilege')
-}
-
-function Grant-DashboardTcbPrivilege {
-    <#
-        tscon requires the caller to hold SeTcbPrivilege to hand a session
-        to console without a password prompt, and to displace whoever
-        currently occupies the destination session -- a hard requirement
-        for Start/Connect RDP's console hand-off, not an edge case. Local
-        Administrators do not hold it by default. Grants it to
-        BUILTIN\Administrators via a local security policy update
-        (secedit), merging into whatever accounts already hold it rather
-        than replacing them. Idempotent: a no-op if already granted.
-
-        IMPORTANT: this only affects new logon tokens. An operator already
-        logged in when this runs must log off/on (or reboot) before tscon
-        will work for them -- the policy change alone does not upgrade an
-        existing session's token.
-    #>
-    if (Test-DashboardTcbPrivilegeGranted) {
-        Write-Host 'SeTcbPrivilege is already granted to Administrators.'
-        return
-    }
-
-    $existingSids = Get-SeTcbPrivilegeSids
-    $allSids = @($existingSids + '*S-1-5-32-544' | Select-Object -Unique)
-
-    $importPath = Join-Path $env:TEMP ("msd-secpol-import-" + [guid]::NewGuid().ToString('N') + '.inf')
-    $dbPath = Join-Path $env:TEMP ("msd-secpol-" + [guid]::NewGuid().ToString('N') + '.sdb')
-    try {
-        $content = @(
-            '[Unicode]'
-            'Unicode=yes'
-            '[Version]'
-            'signature="$CHICAGO$"'
-            'Revision=1'
-            '[Privilege Rights]'
-            "SeTcbPrivilege = $($allSids -join ',')"
-        ) -join "`r`n"
-        Set-Content -LiteralPath $importPath -Value $content -Encoding Unicode
-
-        $result = & secedit /configure /db $dbPath /cfg $importPath /areas USER_RIGHTS 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw "secedit failed to grant SeTcbPrivilege to Administrators (exit $LASTEXITCODE): $result"
-        }
-    } finally {
-        Remove-Item -LiteralPath $importPath, $dbPath -ErrorAction SilentlyContinue
-    }
-
-    Write-Warning 'Granted SeTcbPrivilege ("Act as part of the operating system") to Administrators so tscon can hand sessions to console. This only applies to NEW logon tokens: log off and back on (or reboot), then relaunch the dashboard, before Start/Connect RDP will work.'
 }
 
 function New-DirectoryIfMissing {
@@ -240,13 +40,12 @@ function New-DirectoryIfMissing {
 
 function Invoke-DashboardUiPump {
     <#
-        Long synchronous polling loops in this module (Wait-DashboardRdpSession,
-        Start-DashboardSession's Sunshine-verification wait) run directly on
-        Dashboard.ps1's WinForms UI thread, since its button click handlers
-        call straight into these functions -- so without pumping the message
-        loop during the wait, the whole window stops repainting and Windows
-        reports it as "Not Responding" for the duration. Calling this once
-        per polling iteration keeps it responsive.
+        Connect-DashboardRdp's wait for the RDP session to come up runs
+        directly on Dashboard.ps1's WinForms UI thread, since its button
+        click handlers call straight into it -- so without pumping the
+        message loop during the wait, the whole window stops repainting and
+        Windows reports it as "Not Responding" for the duration. Calling
+        this once per polling iteration keeps it responsive.
 
         Resolved by string (not a literal [System.Windows.Forms.Application]
         type reference) so this is a safe no-op when that assembly isn't
@@ -354,15 +153,14 @@ function Invoke-RdpWrapperInstaller {
 
 function Install-RdpWrapper {
     <#
-        By default resolves the latest release through the GitHub API (like
-        Install-MoonlightPortable/Install-SunshinePortable) rather than only
-        ever downloading the static '.../releases/latest/download/<fixed
-        filename>' URL. That URL's text -- and the asset's filename -- never
-        changes between releases, so a download cache keyed on it alone can
-        never tell a stale cached copy apart from a newer release; the cache
-        name below is keyed on the resolved release tag instead, so normal
-        caching correctly reuses a hit for an unchanged release and
-        correctly re-downloads when a new one is published -- no need to
+        By default resolves the latest release through the GitHub API rather
+        than only ever downloading the static '.../releases/latest/download/
+        <fixed filename>' URL. That URL's text -- and the asset's filename --
+        never changes between releases, so a download cache keyed on it
+        alone can never tell a stale cached copy apart from a newer release;
+        the cache name below is keyed on the resolved release tag instead,
+        so normal caching correctly reuses a hit for an unchanged release
+        and correctly re-downloads when a new one is published -- no need to
         force-wipe the whole download cache to pick up updates.
 
         Pass -Source to bypass API resolution entirely and download a
@@ -543,95 +341,6 @@ function Resolve-GitHubLatestReleaseAsset {
     throw "Could not find a $ComponentName release asset matching patterns: $($AssetNamePatterns -join ', '). Available assets: $available"
 }
 
-function Install-PortableZip {
-    param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][string]$Uri, [Parameter(Mandatory)][string]$Destination)
-    $zip = Join-Path $env:TEMP "$Name.zip"
-    Invoke-DownloadFile -Uri $Uri -Destination $zip -CacheName $Name | Out-Null
-    Expand-ArchiveSafe -Archive $zip -Destination $Destination
-}
-
-function Install-MoonlightPortable {
-    param(
-        [string]$ReleaseApiUri = 'https://api.github.com/repos/moonlight-stream/moonlight-qt/releases/latest',
-        [string[]]$AssetNamePatterns = @('^MoonlightPortable-x64\.zip$', '^MoonlightPortable-x64-.*\.zip$', '^MoonlightPortable.*x64.*\.zip$')
-    )
-    $asset = Resolve-GitHubLatestReleaseAsset -ReleaseApiUri $ReleaseApiUri -AssetNamePatterns $AssetNamePatterns -ComponentName 'Moonlight Portable'
-    Install-PortableZip -Name 'moonlight' -Uri $asset.Uri -Destination (Join-Path $script:InstallRoot 'Stream\Moonlight')
-    if (-not (Test-Path -LiteralPath (Join-Path $script:InstallRoot 'Stream\Moonlight\Moonlight.exe'))) { throw 'Moonlight.exe was not found after extraction.' }
-    Save-ComponentVersion -Component 'Moonlight' -Version $asset.Release
-}
-
-function Install-SunshinePortable {
-    param(
-        [string]$ReleaseApiUri = 'https://api.github.com/repos/LizardByte/Sunshine/releases/latest',
-        [string[]]$AssetNamePatterns = @(
-            '(?i)^Sunshine-Windows-AMD64-portable\.zip$',
-            '(?i)^Sunshine-Windows.*portable.*\.zip$',
-            '(?i)^Sunshine.*Windows.*portable.*\.zip$',
-            '(?i)^Sunshine.*portable.*Windows.*\.zip$'
-        )
-    )
-
-    $destination = Join-Path $script:InstallRoot 'Stream\Sunshine'
-
-    Write-Host 'Installing Sunshine Portable master copy...'
-
-    $asset = Resolve-GitHubLatestReleaseAsset `
-        -ReleaseApiUri $ReleaseApiUri `
-        -AssetNamePatterns $AssetNamePatterns `
-        -ComponentName 'Sunshine Portable'
-
-    Install-PortableZip `
-        -Name 'sunshine' `
-        -Uri $asset.Uri `
-        -Destination $destination
-
-    # Find the actual Sunshine executable anywhere in the extracted archive.
-    $sunshineExe = Get-ChildItem `
-        -LiteralPath $destination `
-        -Recurse `
-        -Filter 'sunshine.exe' `
-        -File `
-        -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-
-    if (-not $sunshineExe) {
-        throw "Sunshine.exe was not found after extraction under '$destination'."
-    }
-
-    # If the ZIP contains a nested Sunshine directory, flatten it.
-    if ($sunshineExe.Directory.FullName -ne $destination) {
-        $sourceDirectory = $sunshineExe.Directory.FullName
-
-        Write-Host "Flattening Sunshine Portable directory:"
-        Write-Host "  $sourceDirectory"
-        Write-Host "  -> $destination"
-
-        Get-ChildItem -LiteralPath $sourceDirectory -Force |
-            Move-Item -Destination $destination -Force
-
-        # Remove the now-empty nested directory.
-        if (Test-Path -LiteralPath $sourceDirectory) {
-            Remove-Item -LiteralPath $sourceDirectory -Recurse -Force -ErrorAction SilentlyContinue
-        }
-    }
-
-    $expectedExe = Join-Path $destination 'sunshine.exe'
-
-    if (-not (Test-Path -LiteralPath $expectedExe)) {
-        throw "Sunshine.exe was not found at expected path '$expectedExe'."
-    }
-
-    Write-Host "Sunshine Portable installed successfully."
-    Write-Host "Executable: $expectedExe"
-    Save-ComponentVersion -Component 'Sunshine' -Version $asset.Release
-}
-
-function Test-TsconAvailable {
-    $tscon = Join-Path $env:SystemRoot 'System32\tscon.exe'
-    return (Test-Path -LiteralPath $tscon)
-}
-
 function Get-RemoteDesktopUsers {
     <#
         Returns direct members of the local "Remote Desktop Users" group.
@@ -768,11 +477,6 @@ function Get-UserRdpSessionId {
     return @(Get-UserSessions -Username $Username | Where-Object { $_.IsRdp } | Sort-Object SessionId | Select-Object -First 1)
 }
 
-function Get-UserConsoleSession {
-    param([Parameter(Mandatory)][string]$Username)
-    return @(Get-UserSessions -Username $Username | Where-Object { $_.IsConsole } | Sort-Object SessionId | Select-Object -First 1)
-}
-
 function Wait-DashboardRdpSession {
     param([Parameter(Mandatory)][string]$Username,[int]$TimeoutSeconds=30,[int[]]$IgnoreSessionIds=@())
     $deadline=(Get-Date).AddSeconds($TimeoutSeconds)
@@ -785,49 +489,14 @@ function Wait-DashboardRdpSession {
     return $null
 }
 
-function Invoke-TsconToConsole {
-    param([Parameter(Mandatory)][int]$SessionId)
-    Assert-Administrator
-    $tscon=Join-Path $env:SystemRoot 'System32\tscon.exe'
-    if (-not (Test-Path -LiteralPath $tscon)) { throw "tscon.exe was not found at '$tscon'." }
-    # Holding SeTcbPrivilege (granted via policy) isn't enough on its own --
-    # it's granted Disabled, and nothing guarantees tscon.exe enables it
-    # itself -- so enable it on this process first; tscon.exe inherits that
-    # enabled state as a child process. See Enable-DashboardTcbPrivilege.
-    if (-not (Enable-DashboardTcbPrivilege)) {
-        throw "Could not enable SeTcbPrivilege for this process, which tscon needs to hand a session to console. If 'SeTcbPrivilege granted to Administrators' fails in Test-DashboardInstallation, re-run the installer; otherwise log off and back on (or reboot) so this session's token picks up the grant, then relaunch the dashboard."
-    }
-    & $tscon $SessionId /dest:console 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "tscon failed for session $SessionId with exit code $LASTEXITCODE." }
-}
-
-function Maintain-DashboardSession {
-    param([Parameter(Mandatory)][string]$Username)
-    Assert-Administrator
-    $sessions=@(Get-UserSessions -Username $Username)
-    if ($sessions.Count -eq 0) { return $null }
-
-    # Do not interrupt a live GUI RDP connection. When the client disconnects,
-    # hand that disconnected RDP session to the console so the user session
-    # remains alive for Sunshine/Moonlight.
-    $disconnectedRdp=$sessions | Where-Object { $_.IsRdp -and $_.State -match '^(Disc|Disconnected)$' } | Sort-Object SessionId | Select-Object -First 1
-    if ($null -ne $disconnectedRdp) {
-        $console = $sessions | Where-Object { $_.IsConsole -and $_.Online } | Select-Object -First 1
-        if ($null -ne $console) {
-            # The preserved console session is already alive. Do not create a
-            # second console session; remove the stale disconnected RDP login.
-            logoff $disconnectedRdp.SessionId 2>$null
-        } else {
-            # No console session exists, so tscon the disconnected RDP session
-            # back to console to revive the user's desktop without logging off.
-            Invoke-TsconToConsole -SessionId $disconnectedRdp.SessionId
-            Start-Sleep -Milliseconds 500
-        }
-    }
-    return (Get-UserSession -Username $Username)
-}
-
 function Invoke-DashboardRdpBootstrap {
+    <#
+        Launches a fully automated RDP login for a dashboard-managed account
+        via Remote Desktop Plus. Connecting to the SAME endpoint for a user
+        who already has a disconnected session reconnects it -- standard RDP
+        behavior -- so this doubles as both the initial connect and any
+        later reconnect; there is no separate "Start" step.
+    #>
     param([Parameter(Mandatory)][string]$Username)
 
     Assert-Administrator
@@ -839,9 +508,7 @@ function Invoke-DashboardRdpBootstrap {
     # Dashboard-managed local accounts always use the username as the Windows
     # account password (see New-DashboardUser), so the login is passed
     # explicitly and completes with no saved-credential prompt to click
-    # through. 127.0.0.2 (not 127.0.0.1) is required: it is the loopback
-    # address RDP Wrapper uses to grant an *additional* session to an account
-    # that is already logged on, instead of reconnecting to its existing one.
+    # through.
     $arguments = @(
         "/v:$($script:RdpHost):$($script:RdpPort)",
         "/u:.\$Username",
@@ -854,32 +521,12 @@ function Invoke-DashboardRdpBootstrap {
     Start-Process -FilePath $rdpPlusPath -ArgumentList $arguments | Out-Null
 
     # 45s, not 30s: a first-ever logon (profile creation, GPU/driver init)
-    # can genuinely take longer than 30s, and was seen timing out here even
-    # though the RDP session had actually come up by the time it was
-    # checked manually a moment later.
+    # can genuinely take longer than 30s.
     $session = Wait-DashboardRdpSession -Username $Username -TimeoutSeconds 45
     if ($null -eq $session) {
         throw "RDP login for '$Username' did not produce an active RDP session within 45 seconds."
     }
     return $session
-}
-
-function Keep-DashboardRdpSessionAlive {
-    param([Parameter(Mandatory)][string]$Username)
-
-    Assert-Administrator
-    $tscon = Join-Path $env:SystemRoot 'System32\tscon.exe'
-    if (-not (Test-Path -LiteralPath $tscon)) { throw "tscon.exe was not found at '$tscon'." }
-
-    $session = Get-UserRdpSessionId -Username $Username
-    if ($null -eq $session) { throw "No active RDP session was found for '$Username'." }
-
-    if (-not (Enable-DashboardTcbPrivilege)) {
-        throw "Could not enable SeTcbPrivilege for this process, which tscon needs to hand a session to console. If 'SeTcbPrivilege granted to Administrators' fails in Test-DashboardInstallation, re-run the installer; otherwise log off and back on (or reboot) so this session's token picks up the grant, then relaunch the dashboard."
-    }
-    & $tscon $session.SessionId /dest:console 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "tscon failed for session $($session.SessionId) with exit code $LASTEXITCODE." }
-    return $session.SessionId
 }
 
 function ConvertTo-HashtableRecursive {
@@ -910,21 +557,16 @@ function Get-DefaultDashboardStateEntry {
         both for brand-new entries and by Repair-DashboardStateEntry to
         back-fill entries loaded from an older sessions.json -- keeping the
         shape in one place instead of duplicating a hashtable literal at
-        every call site (which is exactly how the last field added here
-        ended up missing from some of them).
+        every call site.
     #>
     param([Parameter(Mandatory)][string]$Username, [string]$AccountName)
     if ([string]::IsNullOrWhiteSpace($AccountName)) { $AccountName = ".\$Username" }
     return @{
         Username = $Username
         AccountName = $AccountName
-        SunshinePort = $null
-        SunshineLoopback = $null
         SessionState = 'Stopped'
-        SunshineState = 'Stopped'
         RdpSessionId = $null
         RdpConnectionStatus = 'Disconnected'
-        SunshineProcessId = $null
     }
 }
 
@@ -932,11 +574,12 @@ function Repair-DashboardStateEntry {
     <#
         Set-StrictMode -Version Latest throws "property ... cannot be found"
         on dot-access to a hashtable key that simply isn't there -- so an
-        entry written by an older version of this module (before
-        SunshineLoopback/SunshineProcessId existed, or before any future
-        field) crashes the first time anything reads it that way. Back-fill
-        any missing keys with their default value so every entry always has
-        the full current shape, regardless of when it was first created.
+        entry written by an older version of this module crashes the first
+        time anything reads it that way. Back-fill any missing keys with
+        their default value so every entry always has the full current
+        shape, regardless of when it was first created. Fields from a
+        previous schema (e.g. the old Sunshine-related keys) are left in
+        place, just unused -- nothing here strips them.
     #>
     param([Parameter(Mandatory)][hashtable]$Entry, [Parameter(Mandatory)][string]$Username)
     $accountName = if ($Entry.ContainsKey('AccountName')) { $Entry['AccountName'] } else { $null }
@@ -962,42 +605,21 @@ function Get-DashboardState {
 
 function Save-DashboardState { param([hashtable]$State) $State | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $script:StateFile -Encoding UTF8 }
 
-function Get-ComponentVersions {
-    if (-not (Test-Path -LiteralPath $script:ComponentVersionsFile)) { return @{} }
-    $json = Get-Content -LiteralPath $script:ComponentVersionsFile -Raw
-    if ([string]::IsNullOrWhiteSpace($json)) { return @{} }
-    return (ConvertTo-HashtableRecursive ($json | ConvertFrom-Json))
-}
-
-function Save-ComponentVersion {
-    <#
-        Persists the resolved release tag for a downloaded component so a
-        future run can tell what's currently installed without re-querying
-        the release API -- the "store version information for future update
-        checks" step the installer functions otherwise discard.
-    #>
-    param([Parameter(Mandatory)][string]$Component, [Parameter(Mandatory)][string]$Version)
-    New-DirectoryIfMissing -Path $script:ConfigRoot
-    $versions = Get-ComponentVersions
-    $versions[$Component] = @{ Version = $Version; InstalledAt = (Get-Date).ToString('o') }
-    $versions | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:ComponentVersionsFile -Encoding UTF8
-}
-
 function New-DashboardUser {
     <#
         Dashboard-managed accounts always get the username as their Windows
-        account password. Start/Connect RDP (Invoke-DashboardRdpBootstrap)
-        depend on this: they pass /p:$Username to Remote Desktop Plus for a
-        fully automated login, so the account's real password must match.
-        If -Password is supplied and differs from -Username, the account is
-        still created with that password, but automated RDP login for it
-        will fail until the password is reset to match the username.
+        account password. Connect-DashboardRdp depends on this: it passes
+        /p:$Username to Remote Desktop Plus for a fully automated login, so
+        the account's real password must match. If -Password is supplied
+        and differs from -Username, the account is still created with that
+        password, but automated RDP login for it will fail until the
+        password is reset to match the username.
     #>
     param([Parameter(Mandatory)][string]$Username, [string]$Password)
     Assert-Administrator
     if ([string]::IsNullOrEmpty($Password)) { $Password = $Username }
     if ($Password -ne $Username) {
-        Write-Warning "'$Username' is being created with a password that does not match the username. Start/Connect RDP auto sign-in requires the account password to equal the username; automated RDP login will fail until it is reset to match."
+        Write-Warning "'$Username' is being created with a password that does not match the username. Connect RDP auto sign-in requires the account password to equal the username; automated RDP login will fail until it is reset to match."
     }
 
     net user $Username $Password /add | Out-Null
@@ -1005,338 +627,18 @@ function New-DashboardUser {
 
     $userRoot = Join-Path $script:UsersRoot $Username
     New-DirectoryIfMissing -Path $userRoot
-    Initialize-UserSunshine -Username $Username
 }
 
-function Install-UserSunshineFiles {
+function Connect-DashboardRdp {
     <#
-        Copies the current master Sunshine install into a user's per-user
-        directory and (re)writes their config/apps.json/Startup shortcut.
-        Shared by Initialize-UserSunshine (new user) and
-        Update-DashboardUserSunshine (existing user, e.g. after a newer
-        Sunshine release was installed) so both stay in sync.
-    #>
-    param([Parameter(Mandatory)][string]$Username, [switch]$ReservePort)
-
-    $master = Join-Path $script:InstallRoot 'Stream\Sunshine'
-    if (-not (Test-Path -LiteralPath (Join-Path $master 'sunshine.exe'))) {
-        throw 'Master Sunshine installation is missing. Run the installer to install/update it first.'
-    }
-
-    # Stop any running copy first so an in-use sunshine.exe doesn't block the
-    # copy; it comes back automatically at the user's next logon (Startup
-    # folder) or the next time the operator Starts/reconnects the session.
-    Get-Process -Name 'Sunshine' -ErrorAction SilentlyContinue |
-        Where-Object { $_.Path -like "C:\Users\$Username\AppData\Local\Muti Session Dashboard\Sunshine\*" } |
-        Stop-Process -Force -ErrorAction SilentlyContinue
-
-    $profile = Join-Path 'C:\Users' $Username
-    $dest = Join-Path $profile 'AppData\Local\Muti Session Dashboard\Sunshine'
-    New-DirectoryIfMissing -Path $dest
-
-    # -LiteralPath disables wildcard expansion, so Copy-Item -LiteralPath
-    # "$master\*" was looking for a file literally named "*" -- which never
-    # exists -- and failing as a non-terminating error that nothing here
-    # caught, leaving $dest empty with no error ever surfacing. Enumerate
-    # $master's contents (LiteralPath is safe there, no globbing needed) and
-    # copy each item instead; -ErrorAction Stop makes any real copy failure
-    # (locked file, permissions, disk full) throw immediately too.
-    Get-ChildItem -LiteralPath $master -Force | Copy-Item -Destination $dest -Recurse -Force -ErrorAction Stop
-    if (-not (Test-Path -LiteralPath (Join-Path $dest 'sunshine.exe'))) {
-        throw "sunshine.exe was not found in '$dest' after copying from '$master'."
-    }
-
-    $configDir = Join-Path $profile 'AppData\Local\Muti Session Dashboard\Config'
-    New-DirectoryIfMissing -Path $configDir
-
-    # The loopback address is reserved permanently (unlike the port, which is
-    # only tentatively previewed for a brand-new user and actually
-    # reserved/released per Start/Stop cycle): Moonlight pairs per-host, so
-    # giving a user a stable address avoids forcing a re-pair every session.
-    $loopback = Get-AllocatedLoopback -Username $Username -Reserve
-    $port = Get-AllocatedPort -Username $Username -Reserve:$ReservePort -Loopback $loopback
-    Set-UserSunshineConfig -Username $Username -Port $port -Loopback $loopback
-    New-UserSunshineAppsConfig -Username $Username
-    Set-UserSunshineAutoStart -Username $Username
-
-    return [pscustomobject]@{ Username = $Username; Port = $port; Loopback = $loopback }
-}
-
-function Initialize-UserSunshine {
-    param([Parameter(Mandatory)][string]$Username)
-    Install-UserSunshineFiles -Username $Username -ReservePort:$false | Out-Null
-}
-
-function Update-DashboardUserSunshine {
-    <#
-        Installs/updates Sunshine for an already-created dashboard user --
-        e.g. after Install-SunshinePortable has pulled a newer release into
-        the master copy, this pushes it out to an existing user without
-        recreating their Windows account. Re-copies the executable/assets
-        and refreshes sunshine.conf/the Startup-folder shortcut; apps.json
-        is left alone if it already exists, so an operator's own app-list
-        customization survives an update.
+        Connects (or reconnects) the selected user's RDP session. There is
+        no separate "Start" step -- Invoke-DashboardRdpBootstrap already
+        reconnects an existing disconnected session for the same user the
+        same way a fresh login works, so one action covers both.
     #>
     param([Parameter(Mandatory)][string]$Username)
     Assert-Administrator
 
-    $knownUsers = @(Get-RemoteDesktopUsers | ForEach-Object { $_.Username })
-    if ($knownUsers -notcontains $Username) {
-        throw "'$Username' is not a member of the local 'Remote Desktop Users' group. Create the user first."
-    }
-
-    $result = Install-UserSunshineFiles -Username $Username -ReservePort
-
-    $versions = Get-ComponentVersions
-    $sunshineVersion = if ($versions.ContainsKey('Sunshine')) { $versions['Sunshine'].Version } else { 'unknown' }
-    Write-Host "Sunshine updated for '$Username' (release $sunshineVersion, port $($result.Port), loopback $($result.Loopback))."
-    return $result
-}
-
-function Get-AllocatedPort {
-    <#
-        Sunshine's 'port' is the base of a fixed *family* of ports (see the
-        $script:SunshinePortOffsets table), not a single port -- e.g. two
-        users whose base ports are only 1 apart collide, because the first
-        user's Web port (base+1) lands on the second user's HTTP port
-        (base+0). Every offset is checked against real listeners, not just
-        the bare base value, or "no collision on the base port" would be a
-        false negative.
-
-        Each user's own loopback address (bind_address, see
-        Get-AllocatedLoopback) already isolates its whole port family from
-        every other dashboard-managed user -- a listening socket is
-        (address, port), not port alone -- so pass -Loopback once it's known
-        for a check that also catches something else already listening on
-        that specific address, on top of the shared-address check below.
-    #>
-    param([Parameter(Mandatory)][string]$Username, [switch]$Reserve, [string]$Loopback)
-    $state = Get-DashboardState
-    if ($state.ContainsKey($Username) -and $state[$Username].SunshinePort) { return [int]$state[$Username].SunshinePort }
-    $used = @($state.Values | ForEach-Object { if ($_.SunshinePort) { [int]$_.SunshinePort } })
-
-    $addresses = @('0.0.0.0', '127.0.0.1', '::', '::1')
-    if (-not [string]::IsNullOrWhiteSpace($Loopback)) { $addresses += $Loopback }
-
-    foreach ($port in $script:PortStart..$script:PortEnd) {
-        if ($used -contains $port) { continue }
-
-        $collision = $false
-        foreach ($name in $script:SunshinePortOffsets.Keys) {
-            $candidate = $port + $script:SunshinePortOffsets[$name]
-            if ($candidate -lt 1 -or $candidate -gt 65535) { continue }
-            # Never probe with Test-NetConnection. Get-NetTCPConnection /
-            # Get-NetUDPEndpoint identify an existing listener without
-            # opening a connection or waiting for a response.
-            if ($script:SunshineUdpPortNames -contains $name) {
-                $listener = Get-NetUDPEndpoint -LocalAddress $addresses -LocalPort $candidate -ErrorAction SilentlyContinue
-            } else {
-                $listener = Get-NetTCPConnection -LocalAddress $addresses -LocalPort $candidate -State Listen -ErrorAction SilentlyContinue
-            }
-            if ($null -ne $listener) { $collision = $true; break }
-        }
-        if ($collision) { continue }
-
-        if ($Reserve) {
-            if ($state.ContainsKey($Username)) {
-                # Update in place -- replacing the whole entry here would
-                # clobber fields (RdpSessionId, SunshineLoopback, ...) an
-                # existing user already had recorded.
-                $state[$Username].SunshinePort = $port
-            } else {
-                $state[$Username] = Get-DefaultDashboardStateEntry -Username $Username
-                $state[$Username].SunshinePort = $port
-            }
-            Save-DashboardState -State $state
-        }
-        return $port
-    }
-    throw 'No available Sunshine ports remain.'
-}
-
-function Get-AllocatedLoopback {
-    <#
-        Assigns each dashboard-managed user a distinct loopback address
-        (127.0.0.3, 127.0.0.4, ...) that Sunshine binds to via bind_address.
-        Windows treats the entire 127.0.0.0/8 block as loopback with no
-        extra routing/firewall configuration needed -- the same property
-        Invoke-DashboardRdpBootstrap already relies on for 127.0.0.2.
-
-        This exists because moonlight-qt has no supported way to target a
-        non-default Sunshine port from its command line (confirmed against
-        its own command-line parser source: getHost() never parses a port
-        out of the host argument), so per-user *ports* alone (Get-AllocatedPort)
-        can't be reached by Connect-DashboardMoonlight. A distinct address per
-        user, each answering on Sunshine's default GameStream ports, is what
-        actually makes every user's stream independently reachable.
-    #>
-    param([Parameter(Mandatory)][string]$Username, [switch]$Reserve)
-    $state = Get-DashboardState
-    if ($state.ContainsKey($Username) -and $state[$Username].SunshineLoopback) { return [string]$state[$Username].SunshineLoopback }
-
-    $used = @($state.Values | ForEach-Object { if ($_.SunshineLoopback) { [string]$_.SunshineLoopback } })
-    for ($octet = $script:SunshineLoopbackStartOctet; $octet -le 254; $octet++) {
-        $address = "127.0.0.$octet"
-        if ($used -contains $address) { continue }
-        if ($Reserve) {
-            if ($state.ContainsKey($Username)) {
-                $state[$Username].SunshineLoopback = $address
-            } else {
-                $state[$Username] = Get-DefaultDashboardStateEntry -Username $Username
-                $state[$Username].SunshineLoopback = $address
-            }
-            Save-DashboardState -State $state
-        }
-        return $address
-    }
-    throw 'No available Sunshine loopback addresses remain.'
-}
-
-function Set-UserSunshineConfig {
-    param(
-        [Parameter(Mandatory)][string]$Username,
-        [Parameter(Mandatory)][int]$Port,
-        [Parameter(Mandatory)][string]$Loopback
-    )
-    $configDir = Join-Path (Join-Path 'C:\Users' $Username) 'AppData\Local\Muti Session Dashboard\Config'
-    New-DirectoryIfMissing -Path $configDir
-    $appsFile = Join-Path $configDir 'apps.json'
-    $content = @(
-        '# Generated by Multi Session Dashboard',
-        "port = $Port",
-        "bind_address = $Loopback",
-        "sunshine_name = $Username",
-        'origin_web_ui_allowed = lan',
-        'upnp = disabled',
-        'global_prep_cmd = []',
-        # Default CSRF-allowed origins only cover localhost/127.0.0.1/::1,
-        # but this user's Sunshine answers on its own dedicated loopback
-        # address (see Get-AllocatedLoopback), not literally 127.0.0.1, so
-        # its own web UI origin needs to be added explicitly or its web UI
-        # gets CSRF-blocked. Web UI port is the base port + 1 (Sunshine's
-        # fixed port family, see $script:SunshinePortOffsets).
-        "csrf_allowed_origins = https://$($Loopback):$($Port + 1)",
-        "file_apps = $appsFile",
-        "log_path = $(Join-Path $configDir 'sunshine.log')",
-        "credentials_file = $(Join-Path $configDir 'sunshine_state.json')",
-        "pkey = $(Join-Path $configDir 'credentials\cakey.pem')",
-        "cert = $(Join-Path $configDir 'credentials\cacert.pem')"
-    ) -join "`r`n"
-    Set-Content -LiteralPath (Join-Path $configDir 'sunshine.conf') -Value $content -Encoding UTF8
-}
-
-function New-UserSunshineAppsConfig {
-    <#
-        Writes a minimal per-user apps.json (Sunshine's list of streamable
-        apps/desktops) with a single "Desktop" entry, matching the app name
-        Connect-DashboardMoonlight passes to `moonlight stream <host> <app>`.
-        Never overwrites an operator's own customization on repeat runs.
-    #>
-    param([Parameter(Mandatory)][string]$Username)
-    $configDir = Join-Path (Join-Path 'C:\Users' $Username) 'AppData\Local\Muti Session Dashboard\Config'
-    New-DirectoryIfMissing -Path $configDir
-    $appsFile = Join-Path $configDir 'apps.json'
-
-    # Sunshine's parser reads "env" with get_child (not the _optional
-    # variant), so a top-level "env" key is required -- without it the whole
-    # file fails to parse and Sunshine falls back to no apps at all, which
-    # is exactly why "Desktop" was missing from Moonlight's app list.
-    if (Test-Path -LiteralPath $appsFile) {
-        # Self-heal a file written before "env" was known to be required,
-        # preserving whatever apps are already there (an operator's own
-        # customization) rather than overwriting the file.
-        try {
-            $existing = Get-Content -LiteralPath $appsFile -Raw | ConvertFrom-Json
-            if (-not ($existing.PSObject.Properties.Name -contains 'env')) {
-                $existing | Add-Member -NotePropertyName env -NotePropertyValue ([pscustomobject]@{}) -Force
-                $existing | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $appsFile -Encoding UTF8
-            }
-        } catch {
-            Write-Verbose "Could not repair apps.json for '$Username': $($_.Exception.Message)"
-        }
-        return
-    }
-
-    $apps = [ordered]@{ env = @{}; apps = @(@{ name = 'Desktop'; 'image-path' = 'desktop.png' }) }
-    $apps | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $appsFile -Encoding UTF8
-}
-
-function Set-UserSunshineAutoStart {
-    <#
-        Creates a Startup-folder shortcut so Sunshine launches automatically
-        at this user's own interactive logon -- running as that user, not as
-        the elevated dashboard/operator account a Start-Process call from the
-        dashboard would otherwise run it under. See Test-UserSunshineRunning
-        for the verification this is paired with, and Start-DashboardSession
-        for how the two are used together.
-    #>
-    param([Parameter(Mandatory)][string]$Username)
-    $profile = Join-Path 'C:\Users' $Username
-    $sunshine = Join-Path $profile 'AppData\Local\Muti Session Dashboard\Sunshine\sunshine.exe'
-    $conf = Join-Path $profile 'AppData\Local\Muti Session Dashboard\Config\sunshine.conf'
-    $startupDir = Join-Path $profile 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup'
-    New-DirectoryIfMissing -Path $startupDir
-    $shortcutPath = Join-Path $startupDir 'Sunshine.lnk'
-
-    $shell = New-Object -ComObject WScript.Shell
-    $shortcut = $shell.CreateShortcut($shortcutPath)
-    $shortcut.TargetPath = $sunshine
-    $shortcut.Arguments = "`"$conf`""
-    $shortcut.WorkingDirectory = Split-Path -Parent $sunshine
-    $shortcut.WindowStyle = 7 # minimized
-    $shortcut.Description = "Multi Session Dashboard: auto-start Sunshine for $Username"
-    $shortcut.Save()
-}
-
-function Test-UserSunshineRunning {
-    <#
-        The real per-user verification the spec requires: do not report
-        Sunshine as running just because a process was launched. Confirms a
-        sunshine.exe process is both the one under this user's own per-user
-        copy AND actually owned by that Windows user (not SYSTEM,
-        Administrator, or the dashboard's own account), and that its
-        assigned loopback address/port is listening.
-    #>
-    param([Parameter(Mandatory)][string]$Username)
-
-    $expectedPath = Join-Path (Join-Path 'C:\Users' $Username) 'AppData\Local\Muti Session Dashboard\Sunshine\sunshine.exe'
-    $result = [pscustomobject]@{ Running = $false; ProcessId = $null; Owner = $null; PortListening = $false }
-
-    $processes = @(Get-CimInstance -ClassName Win32_Process -Filter "Name='sunshine.exe'" -ErrorAction SilentlyContinue)
-    foreach ($process in $processes) {
-        if ($process.ExecutablePath -and $process.ExecutablePath -ieq $expectedPath) {
-            $ownerInfo = Invoke-CimMethod -InputObject $process -MethodName GetOwner -ErrorAction SilentlyContinue
-            $owner = if ($ownerInfo) { [string]$ownerInfo.User } else { $null }
-            if ($owner -ieq $Username) {
-                $result.Running = $true
-                $result.ProcessId = [int]$process.ProcessId
-                $result.Owner = $owner
-                break
-            }
-        }
-    }
-
-    if ($result.Running) {
-        $state = Get-DashboardState
-        $port = if ($state.ContainsKey($Username)) { $state[$Username].SunshinePort } else { $null }
-        $loopback = if ($state.ContainsKey($Username)) { $state[$Username].SunshineLoopback } else { $null }
-        if ($port -and $loopback) {
-            $listener = Get-NetTCPConnection -LocalAddress $loopback -LocalPort ([int]$port) -State Listen -ErrorAction SilentlyContinue
-            $result.PortListening = ($null -ne $listener)
-        }
-    }
-
-    return $result
-}
-
-function Start-DashboardSession {
-    param([Parameter(Mandatory)][string]$Username)
-    Assert-Administrator
-    if (-not (Test-TsconAvailable)) { throw 'Windows tscon.exe is required but was not found.' }
-
-    # 0) Validate preconditions before attempting anything: known user -> RDP
-    #    Wrapper healthy -> per-user Sunshine installed. Failing fast here
-    #    avoids a confusing partial failure deep inside the RDP bootstrap.
     $knownUsers = @(Get-RemoteDesktopUsers | ForEach-Object { $_.Username })
     if ($knownUsers -notcontains $Username) {
         throw "'$Username' is not a member of the local 'Remote Desktop Users' group."
@@ -1345,127 +647,22 @@ function Start-DashboardSession {
     if (-not $wrapperCheck.Success) {
         throw "RDP Wrapper is not correctly configured: $($wrapperCheck.Failures -join ', ')"
     }
-    $sunshineExe = Join-Path (Join-Path 'C:\Users' $Username) 'AppData\Local\Muti Session Dashboard\Sunshine\sunshine.exe'
-    if (-not (Test-Path -LiteralPath $sunshineExe)) {
-        throw "Sunshine is not installed for '$Username'. Create the user through the dashboard so Initialize-UserSunshine can run first."
-    }
-    if (-not (Test-CurrentTokenHasTcbPrivilege)) {
-        throw "This session's logon token does not hold SeTcbPrivilege, which tscon needs to hand a session to console. The installer grants this to Administrators, but only new logon tokens pick it up -- log off and back on (or reboot), then relaunch the dashboard, before using Start."
-    }
-    if (-not (Enable-DashboardTcbPrivilege)) {
-        throw "SeTcbPrivilege is present on this session's token but could not be enabled, which tscon needs to hand a session to console. Re-run the installer to confirm the policy grant, then log off and back on (or reboot) and relaunch the dashboard."
-    }
 
-    # 1) Create a real 1920x1080 RDP login for the selected user via Remote
-    #    Desktop Plus. If this doesn't produce an Active RDP session in time,
-    #    fail cleanly here -- tscon hand-off is never attempted.
-    try {
-        $rdpSession = Invoke-DashboardRdpBootstrap -Username $Username
-    } catch {
-        throw "RDP session was not created. TSCON hand-off was not attempted. $($_.Exception.Message)"
-    }
-
-    # 2) Hand the RDP session to the local console so the Windows session survives.
-    Invoke-TsconToConsole -SessionId $rdpSession.SessionId
-
-    # 3) Confirm the Windows session is still online after the handoff.
-    Start-Sleep -Milliseconds 750
-    $online = Get-UserSession -Username $Username
-    if ($null -eq $online -or -not $online.Online) {
-        throw "RDP session for '$Username' was handed off with tscon, but the user is not reported Active by Windows."
-    }
-
-    # 4) Sunshine auto-starts under the user's own identity via the Startup-
-    #    folder shortcut created at user-creation time (Set-UserSunshineAutoStart)
-    #    -- it is deliberately never Start-Process'd from here, since that
-    #    would run it as the elevated dashboard/operator account instead of
-    #    the target user. Poll for the real, verified state instead of
-    #    trusting that launching it worked.
-    $loopback = Get-AllocatedLoopback -Username $Username -Reserve
-    $port = Get-AllocatedPort -Username $Username -Reserve -Loopback $loopback
-    Set-UserSunshineConfig -Username $Username -Port $port -Loopback $loopback
-
-    $deadline = (Get-Date).AddSeconds(20)
-    $sunshineStatus = Test-UserSunshineRunning -Username $Username
-    while (-not $sunshineStatus.Running -and (Get-Date) -lt $deadline) {
-        Invoke-DashboardUiPump
-        Start-Sleep -Milliseconds 500
-        $sunshineStatus = Test-UserSunshineRunning -Username $Username
-    }
-    if (-not $sunshineStatus.Running) {
-        throw "Sunshine did not start under '$Username' within 20 seconds. Check the Startup-folder entry (AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\Sunshine.lnk) and Group Policy for that user; Sunshine is intentionally never launched under the dashboard's own account."
-    }
-
-    $state = Get-DashboardState
-    $state[$Username].RdpSessionId = $online.SessionId
-    $state[$Username].RdpConnectionStatus = 'Online'
-    $state[$Username].SessionState = 'Running'
-    $state[$Username].SunshineState = 'Running'
-    $state[$Username].SunshineProcessId = $sunshineStatus.ProcessId
-    Save-DashboardState -State $state
-    return $online
-}
-
-function Connect-DashboardRdp {
-    param([Parameter(Mandatory)][string]$Username)
-    Assert-Administrator
-
-    # Reconnects to the user's Windows session using native mstsc against the
-    # per-user RDP alias and saved credential. If Start previously handed the
-    # session off to the console with tscon, this creates a fresh RDP session
-    # for the same Windows logon rather than a brand new user session; the
-    # session monitor hands it back to console via tscon when it disconnects.
     $rdp = Invoke-DashboardRdpBootstrap -Username $Username
 
-    $state=Get-DashboardState
+    $state = Get-DashboardState
     if ($state.ContainsKey($Username)) {
-        $state[$Username].RdpSessionId=$rdp.SessionId
-        $state[$Username].RdpConnectionStatus='Connected'
-        $state[$Username].SessionState='Running'
+        $state[$Username].RdpSessionId = $rdp.SessionId
+        $state[$Username].RdpConnectionStatus = 'Connected'
+        $state[$Username].SessionState = 'Running'
         Save-DashboardState -State $state
     }
     return $rdp
 }
 
-function Keep-Alive-DashboardRdp {
-    param([Parameter(Mandatory)][string]$Username)
-    $sessionId = Keep-DashboardRdpSessionAlive -Username $Username
-    $state = Get-DashboardState
-    if ($state.ContainsKey($Username)) {
-        $state[$Username].RdpSessionId = $sessionId
-        $state[$Username].RdpConnectionStatus = 'Connected'
-        Save-DashboardState -State $state
-    }
-    return $sessionId
-}
-
-function Connect-DashboardMoonlight {
-    param([Parameter(Mandatory)][string]$Username)
-    $moonlight = Join-Path $script:InstallRoot 'Stream\Moonlight\Moonlight.exe'
-    if (-not (Test-Path -LiteralPath $moonlight)) { throw 'Moonlight.exe is missing.' }
-
-    $state = Get-DashboardState
-    if (-not $state.ContainsKey($Username) -or [string]::IsNullOrWhiteSpace([string]$state[$Username].SunshineLoopback)) {
-        throw "No Sunshine target is assigned for '$Username' yet. Create the user (or run Start) before Connect Moonlight."
-    }
-    $loopback = [string]$state[$Username].SunshineLoopback
-
-    # moonlight-qt's CLI has no supported way to target a non-default
-    # Sunshine port (confirmed against its command-line parser source), so
-    # each user gets its own loopback address instead (Get-AllocatedLoopback)
-    # and Sunshine always answers there on its default GameStream ports.
-    # 'stream <host> <app>' and '--absolute-mouse' (backing "optimize mouse
-    # for remote desktop instead of games") are real StreamCommandLineParser
-    # options, not flags this dashboard invented.
-    $arguments = @('stream', $loopback, 'Desktop', '--display-mode', 'windowed', '--resolution', '1920x1080', '--absolute-mouse')
-    Start-Process -FilePath $moonlight -ArgumentList $arguments | Out-Null
-}
-
 function Stop-DashboardSession {
     <#
-        Keep this simple: sign the user off. Logging off terminates every
-        process in their session, including Sunshine, so there's no need to
-        separately hunt down and kill it.
+        Keep this simple: sign the user off.
     #>
     param([Parameter(Mandatory)][string]$Username)
     $session = Get-UserSession -Username $Username
@@ -1473,14 +670,8 @@ function Stop-DashboardSession {
 
     $state = Get-DashboardState
     if ($state.ContainsKey($Username)) {
-        # SunshineLoopback is intentionally left in place: it's a stable
-        # per-user identity (Moonlight pairs per-host), unlike the port,
-        # which is freely re-allocated on the next Start.
-        $state[$Username].SunshinePort = $null
         $state[$Username].SessionState = 'Stopped'
-        $state[$Username].SunshineState = 'Stopped'
         $state[$Username].RdpConnectionStatus = 'Disconnected'
-        $state[$Username].SunshineProcessId = $null
         Save-DashboardState -State $state
     }
 }
@@ -1490,14 +681,10 @@ function Test-DashboardInstallation {
         'RDP Wrapper installed' = (Test-Path -LiteralPath $script:RdpWrapperRoot)
         'TermWrap configured' = (Test-RdpWrapperConfiguration).Success
         'Remote Desktop enabled' = (((Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -ErrorAction SilentlyContinue).fDenyTSConnections) -eq 0)
-        'Moonlight downloaded' = (Test-Path -LiteralPath (Join-Path $script:InstallRoot 'Stream\Moonlight\Moonlight.exe'))
-        'Sunshine downloaded' = (Test-Path -LiteralPath (Join-Path $script:InstallRoot 'Stream\Sunshine\Sunshine.exe'))
-        'tscon available' = (Test-TsconAvailable)
-        'SeTcbPrivilege granted to Administrators' = (Test-DashboardTcbPrivilegeGranted)
         'Remote Desktop Plus installed' = (Test-Path -LiteralPath (Resolve-RemoteDesktopPlusPath))
         'Dashboard installed' = (Test-Path -LiteralPath (Join-Path $script:InstallRoot 'Dashboard.ps1'))
     }
     $checks.GetEnumerator() | ForEach-Object { [pscustomobject]@{ Check=$_.Key; Passed=[bool]$_.Value } }
 }
 
-Export-ModuleMember -Function *-Dashboard*,Install-*,Test-*,New-DashboardUser,Start-DashboardSession,Stop-DashboardSession,Connect-DashboardRdp,Keep-Alive-DashboardRdp,Connect-DashboardMoonlight,Assert-Administrator,Set-DashboardPaths,Invoke-RdpWrapperInstaller,Get-RdpEndpoint,Get-DashboardState,Get-RemoteDesktopUsers,Get-UserSession,Get-UserSessions,Get-UserRdpSessionId,Get-UserConsoleSession,Maintain-DashboardSession,Invoke-DashboardRdpBootstrap,Get-DefaultDashboardStateEntry
+Export-ModuleMember -Function *-Dashboard*,Install-*,Test-*,New-DashboardUser,Stop-DashboardSession,Connect-DashboardRdp,Assert-Administrator,Set-DashboardPaths,Invoke-RdpWrapperInstaller,Get-RdpEndpoint,Get-DashboardState,Get-RemoteDesktopUsers,Get-UserSession,Get-UserSessions,Get-UserRdpSessionId,Invoke-DashboardRdpBootstrap,Get-DefaultDashboardStateEntry
