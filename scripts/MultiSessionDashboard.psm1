@@ -91,9 +91,95 @@ function Test-CurrentTokenHasTcbPrivilege {
         happened needs to log off/on (or reboot) before tscon actually works
         for them -- whoami /priv omits a privilege entirely (not merely
         'Disabled') when the token doesn't hold it at all.
+
+        NOTE: this only confirms the privilege is *present* -- see
+        Enable-DashboardTcbPrivilege for whether it's actually usable, which
+        is a separate, additional requirement.
     #>
     $priv = & whoami /priv 2>$null
     return (($priv -join "`n") -match '(?im)^SeTcbPrivilege\s')
+}
+
+function Enable-DashboardTcbPrivilege {
+    <#
+        Granting SeTcbPrivilege via local policy (Grant-DashboardTcbPrivilege)
+        only puts it on the token in the *Disabled* state -- confirmed by a
+        live whoami /priv showing exactly that after logging off/on following
+        the grant. Windows does not auto-enable privileges granted this way;
+        only a small fixed set (SeDebugPrivilege, SeImpersonatePrivilege, ...)
+        is enabled by default on an elevated Administrator token. A disabled
+        privilege the token holds cannot actually be used until something
+        calls AdjustTokenPrivileges to enable it, and there's no guarantee
+        tscon.exe's own implementation does that -- so this process enables
+        it on its own token here, right before invoking tscon; the enabled
+        state is inherited by tscon.exe as a child process.
+
+        Returns $true only if the privilege was both present and
+        successfully enabled (AdjustTokenPrivileges can report success while
+        silently not enabling everything requested -- ERROR_NOT_ALL_ASSIGNED
+        -- so the last Win32 error is checked too, not just the return value).
+    #>
+    if (-not ('MultiSessionDashboard.TokenPrivilege' -as [type])) {
+        Add-Type -Language CSharp -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace MultiSessionDashboard {
+    [StructLayout(LayoutKind.Sequential)]
+    struct LUID { public uint LowPart; public int HighPart; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct LUID_AND_ATTRIBUTES { public LUID Luid; public uint Attributes; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct TOKEN_PRIVILEGES { public uint PrivilegeCount; public LUID_AND_ATTRIBUTES Privileges; }
+
+    public static class TokenPrivilege {
+        [DllImport("advapi32.dll", SetLastError = true)]
+        static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern bool LookupPrivilegeValueW(string lpSystemName, string lpName, out LUID lpLuid);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        static extern bool AdjustTokenPrivileges(IntPtr TokenHandle, bool DisableAllPrivileges, ref TOKEN_PRIVILEGES NewState, uint BufferLength, IntPtr PreviousState, IntPtr ReturnLength);
+
+        [DllImport("kernel32.dll")]
+        static extern bool CloseHandle(IntPtr hObject);
+
+        const uint TOKEN_ADJUST_PRIVILEGES = 0x0020;
+        const uint TOKEN_QUERY = 0x0008;
+        const uint SE_PRIVILEGE_ENABLED = 0x0002;
+        const int ERROR_NOT_ALL_ASSIGNED = 1300;
+
+        public static bool EnablePrivilege(string privilege) {
+            IntPtr tokenHandle = IntPtr.Zero;
+            try {
+                if (!OpenProcessToken(System.Diagnostics.Process.GetCurrentProcess().Handle, TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, out tokenHandle)) {
+                    return false;
+                }
+                LUID luid;
+                if (!LookupPrivilegeValueW(null, privilege, out luid)) {
+                    return false;
+                }
+                TOKEN_PRIVILEGES tp = new TOKEN_PRIVILEGES();
+                tp.PrivilegeCount = 1;
+                tp.Privileges = new LUID_AND_ATTRIBUTES { Luid = luid, Attributes = SE_PRIVILEGE_ENABLED };
+                bool ok = AdjustTokenPrivileges(tokenHandle, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
+                int error = Marshal.GetLastWin32Error();
+                // AdjustTokenPrivileges can return true while silently not
+                // enabling everything requested -- only ERROR_SUCCESS (0)
+                // means the privilege actually got enabled.
+                return ok && error == 0;
+            } finally {
+                if (tokenHandle != IntPtr.Zero) { CloseHandle(tokenHandle); }
+            }
+        }
+    }
+}
+'@
+    }
+    return [MultiSessionDashboard.TokenPrivilege]::EnablePrivilege('SeTcbPrivilege')
 }
 
 function Grant-DashboardTcbPrivilege {
@@ -704,6 +790,13 @@ function Invoke-TsconToConsole {
     Assert-Administrator
     $tscon=Join-Path $env:SystemRoot 'System32\tscon.exe'
     if (-not (Test-Path -LiteralPath $tscon)) { throw "tscon.exe was not found at '$tscon'." }
+    # Holding SeTcbPrivilege (granted via policy) isn't enough on its own --
+    # it's granted Disabled, and nothing guarantees tscon.exe enables it
+    # itself -- so enable it on this process first; tscon.exe inherits that
+    # enabled state as a child process. See Enable-DashboardTcbPrivilege.
+    if (-not (Enable-DashboardTcbPrivilege)) {
+        throw "Could not enable SeTcbPrivilege for this process, which tscon needs to hand a session to console. If 'SeTcbPrivilege granted to Administrators' fails in Test-DashboardInstallation, re-run the installer; otherwise log off and back on (or reboot) so this session's token picks up the grant, then relaunch the dashboard."
+    }
     & $tscon $SessionId /dest:console 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "tscon failed for session $SessionId with exit code $LASTEXITCODE." }
 }
@@ -781,6 +874,9 @@ function Keep-DashboardRdpSessionAlive {
     $session = Get-UserRdpSessionId -Username $Username
     if ($null -eq $session) { throw "No active RDP session was found for '$Username'." }
 
+    if (-not (Enable-DashboardTcbPrivilege)) {
+        throw "Could not enable SeTcbPrivilege for this process, which tscon needs to hand a session to console. If 'SeTcbPrivilege granted to Administrators' fails in Test-DashboardInstallation, re-run the installer; otherwise log off and back on (or reboot) so this session's token picks up the grant, then relaunch the dashboard."
+    }
     & $tscon $session.SessionId /dest:console 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "tscon failed for session $($session.SessionId) with exit code $LASTEXITCODE." }
     return $session.SessionId
@@ -1255,6 +1351,9 @@ function Start-DashboardSession {
     }
     if (-not (Test-CurrentTokenHasTcbPrivilege)) {
         throw "This session's logon token does not hold SeTcbPrivilege, which tscon needs to hand a session to console. The installer grants this to Administrators, but only new logon tokens pick it up -- log off and back on (or reboot), then relaunch the dashboard, before using Start."
+    }
+    if (-not (Enable-DashboardTcbPrivilege)) {
+        throw "SeTcbPrivilege is present on this session's token but could not be enabled, which tscon needs to hand a session to console. Re-run the installer to confirm the policy grant, then log off and back on (or reboot) and relaunch the dashboard."
     }
 
     # 1) Create a real 1920x1080 RDP login for the selected user via Remote
