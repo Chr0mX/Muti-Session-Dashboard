@@ -152,6 +152,25 @@ function New-DirectoryIfMissing {
     }
 }
 
+function Invoke-DashboardUiPump {
+    <#
+        Long synchronous polling loops in this module (Wait-DashboardRdpSession,
+        Start-DashboardSession's Sunshine-verification wait) run directly on
+        Dashboard.ps1's WinForms UI thread, since its button click handlers
+        call straight into these functions -- so without pumping the message
+        loop during the wait, the whole window stops repainting and Windows
+        reports it as "Not Responding" for the duration. Calling this once
+        per polling iteration keeps it responsive.
+
+        Resolved by string (not a literal [System.Windows.Forms.Application]
+        type reference) so this is a safe no-op when that assembly isn't
+        loaded, e.g. when this module is used from the non-interactive
+        installer, which never loads WinForms.
+    #>
+    $appType = 'System.Windows.Forms.Application' -as [type]
+    if ($appType) { $appType::DoEvents() }
+}
+
 function Get-SafeCacheFileName {
     param([Parameter(Mandatory)][string]$Uri, [Parameter(Mandatory)][string]$Name)
     $extension = [IO.Path]::GetExtension(([Uri]$Uri).AbsolutePath)
@@ -674,6 +693,7 @@ function Wait-DashboardRdpSession {
     do {
         $session=@(Get-UserSessions -Username $Username | Where-Object { $_.IsRdp -and $_.State -match '^(Active|Conn)$' -and ($IgnoreSessionIds -notcontains $_.SessionId) } | Sort-Object SessionId | Select-Object -First 1)
         if ($null -ne $session -and @($session).Count -gt 0) { return $session[0] }
+        Invoke-DashboardUiPump
         Start-Sleep -Milliseconds 500
     } while ((Get-Date) -lt $deadline)
     return $null
@@ -740,9 +760,13 @@ function Invoke-DashboardRdpBootstrap {
     Write-Host "Starting Remote Desktop Plus for '$Username' at 1920x1080."
     Start-Process -FilePath $rdpPlusPath -ArgumentList $arguments | Out-Null
 
-    $session = Wait-DashboardRdpSession -Username $Username -TimeoutSeconds 30
+    # 45s, not 30s: a first-ever logon (profile creation, GPU/driver init)
+    # can genuinely take longer than 30s, and was seen timing out here even
+    # though the RDP session had actually come up by the time it was
+    # checked manually a moment later.
+    $session = Wait-DashboardRdpSession -Username $Username -TimeoutSeconds 45
     if ($null -eq $session) {
-        throw "RDP login for '$Username' did not produce an active RDP session within 30 seconds."
+        throw "RDP login for '$Username' did not produce an active RDP session within 45 seconds."
     }
     return $session
 }
@@ -1116,8 +1140,28 @@ function New-UserSunshineAppsConfig {
     $configDir = Join-Path (Join-Path 'C:\Users' $Username) 'AppData\Local\Muti Session Dashboard\Config'
     New-DirectoryIfMissing -Path $configDir
     $appsFile = Join-Path $configDir 'apps.json'
-    if (Test-Path -LiteralPath $appsFile) { return }
-    $apps = [ordered]@{ apps = @(@{ name = 'Desktop'; 'image-path' = 'desktop.png' }) }
+
+    # Sunshine's parser reads "env" with get_child (not the _optional
+    # variant), so a top-level "env" key is required -- without it the whole
+    # file fails to parse and Sunshine falls back to no apps at all, which
+    # is exactly why "Desktop" was missing from Moonlight's app list.
+    if (Test-Path -LiteralPath $appsFile) {
+        # Self-heal a file written before "env" was known to be required,
+        # preserving whatever apps are already there (an operator's own
+        # customization) rather than overwriting the file.
+        try {
+            $existing = Get-Content -LiteralPath $appsFile -Raw | ConvertFrom-Json
+            if (-not ($existing.PSObject.Properties.Name -contains 'env')) {
+                $existing | Add-Member -NotePropertyName env -NotePropertyValue ([pscustomobject]@{}) -Force
+                $existing | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $appsFile -Encoding UTF8
+            }
+        } catch {
+            Write-Verbose "Could not repair apps.json for '$Username': $($_.Exception.Message)"
+        }
+        return
+    }
+
+    $apps = [ordered]@{ env = @{}; apps = @(@{ name = 'Desktop'; 'image-path' = 'desktop.png' }) }
     $apps | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $appsFile -Encoding UTF8
 }
 
@@ -1245,6 +1289,7 @@ function Start-DashboardSession {
     $deadline = (Get-Date).AddSeconds(20)
     $sunshineStatus = Test-UserSunshineRunning -Username $Username
     while (-not $sunshineStatus.Running -and (Get-Date) -lt $deadline) {
+        Invoke-DashboardUiPump
         Start-Sleep -Milliseconds 500
         $sunshineStatus = Test-UserSunshineRunning -Username $Username
     }
