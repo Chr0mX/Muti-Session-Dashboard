@@ -9,6 +9,8 @@ param(
     [string[]]$MoonlightAssetNamePatterns = @('^MoonlightPortable-x64\.zip$', '^MoonlightPortable-x64-.*\.zip$', '^MoonlightPortable.*x64.*\.zip$'),
     [string]$SunshineReleaseApiUri = 'https://api.github.com/repos/LizardByte/Sunshine/releases/latest',
     [string[]]$SunshineAssetNamePatterns = @('(?i)^sunshine-windows-portable\.zip$', '(?i)^sunshine-windows.*portable.*\.zip$', '(?i)^sunshine.*windows.*portable.*\.zip$', '(?i)^sunshine.*portable.*windows.*\.zip$'),
+    [string]$RemoteDesktopPlusUri = 'https://www.donkz.nl/download/remote-desktop-plus-msi/',
+    [int]$RemoteDesktopPlusInstallTimeoutSeconds = 300,
     [switch]$RefreshDownloadCache
 )
 
@@ -46,7 +48,10 @@ Install-MoonlightPortable -ReleaseApiUri $MoonlightReleaseApiUri -AssetNamePatte
 Write-Host 'Installing Sunshine Portable master copy...'
 Install-SunshinePortable -ReleaseApiUri $SunshineReleaseApiUri -AssetNamePatterns $SunshineAssetNamePatterns
 
-Write-Host 'Using native Windows tscon/mstsc for RDP session management on 127.0.0.2:3389...'
+Write-Host 'Installing Remote Desktop Plus...'
+Install-RemoteDesktopPlus -Source $RemoteDesktopPlusUri -InstallTimeoutSeconds $RemoteDesktopPlusInstallTimeoutSeconds
+
+Write-Host 'Using native Windows tscon for RDP session handoff and Remote Desktop Plus for automated RDP login on 127.0.0.2:3389...'
 if (-not (Test-TsconAvailable)) { throw 'tscon.exe is required but was not found in System32.' }
 
 $checks = Test-DashboardInstallation

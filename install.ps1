@@ -28,7 +28,9 @@ param(
     [string]$MoonlightReleaseApiUri = 'https://api.github.com/repos/moonlight-stream/moonlight-qt/releases/latest',
     [string[]]$MoonlightAssetNamePatterns = @('^MoonlightPortable-x64\.zip$', '^MoonlightPortable-x64-.*\.zip$', '^MoonlightPortable.*x64.*\.zip$'),
     [string]$SunshineReleaseApiUri = 'https://api.github.com/repos/LizardByte/Sunshine/releases/latest',
-    [string[]]$SunshineAssetNamePatterns = @('(?i)^sunshine-windows-portable\.zip$', '(?i)^sunshine-windows.*portable.*\.zip$', '(?i)^sunshine.*windows.*portable.*\.zip$', '(?i)^sunshine.*portable.*windows.*\.zip$')
+    [string[]]$SunshineAssetNamePatterns = @('(?i)^sunshine-windows-portable\.zip$', '(?i)^sunshine-windows.*portable.*\.zip$', '(?i)^sunshine.*windows.*portable.*\.zip$', '(?i)^sunshine.*portable.*windows.*\.zip$'),
+    [string]$RemoteDesktopPlusUri = 'https://www.donkz.nl/download/remote-desktop-plus-msi/',
+    [int]$RemoteDesktopPlusInstallTimeoutSeconds = 300
 )
 
 $ErrorActionPreference = 'Stop'
@@ -63,6 +65,8 @@ try {
         -MoonlightAssetNamePatterns $MoonlightAssetNamePatterns `
         -SunshineReleaseApiUri $SunshineReleaseApiUri `
         -SunshineAssetNamePatterns $SunshineAssetNamePatterns `
+        -RemoteDesktopPlusUri $RemoteDesktopPlusUri `
+        -RemoteDesktopPlusInstallTimeoutSeconds $RemoteDesktopPlusInstallTimeoutSeconds `
         -RefreshDownloadCache
 } finally {
     Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
