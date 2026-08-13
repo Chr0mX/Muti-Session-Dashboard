@@ -608,9 +608,21 @@ function Ensure-DashboardRdpAlias {
     $alias = Get-DashboardRdpAlias -Username $Username
     $hosts = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
     $lines = @(Get-Content -LiteralPath $hosts -ErrorAction Stop)
-    $pattern = '^\s*127\.0\.0\.1\s+' + [regex]::Escape($alias) + '(?:\s|$)'
+
+    # RDP Wrapper only grants a distinct, additional session for an account
+    # that is already logged on (instead of just reconnecting to its
+    # existing session) when the connection targets the second loopback
+    # address ($script:RdpHost, 127.0.0.2) rather than 127.0.0.1. The alias
+    # must resolve there, or Start/Connect RDP never produce a new session
+    # and time out even though a manual connect to 127.0.0.2 works fine.
+    $pattern = '^\s*' + [regex]::Escape($script:RdpHost) + '\s+' + [regex]::Escape($alias) + '(?:\s|$)'
+    $stalePattern = '^\s*(?!' + [regex]::Escape($script:RdpHost) + '\s)\S+\s+' + [regex]::Escape($alias) + '(?:\s|$)'
+    if ($lines -match $stalePattern) {
+        $lines = $lines | Where-Object { $_ -notmatch $stalePattern }
+        Set-Content -LiteralPath $hosts -Value $lines
+    }
     if (-not ($lines -match $pattern)) {
-        Add-Content -LiteralPath $hosts -Value "`r`n127.0.0.1 $alias"
+        Add-Content -LiteralPath $hosts -Value "`r`n$($script:RdpHost) $alias"
         ipconfig /flushdns | Out-Null
     }
     return $alias
