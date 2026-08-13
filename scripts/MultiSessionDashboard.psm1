@@ -1089,6 +1089,13 @@ function Set-UserSunshineConfig {
         'origin_web_ui_allowed = lan',
         'upnp = disabled',
         'global_prep_cmd = []',
+        # Default CSRF-allowed origins only cover localhost/127.0.0.1/::1,
+        # but this user's Sunshine answers on its own dedicated loopback
+        # address (see Get-AllocatedLoopback), not literally 127.0.0.1, so
+        # its own web UI origin needs to be added explicitly or its web UI
+        # gets CSRF-blocked. Web UI port is the base port + 1 (Sunshine's
+        # fixed port family, see $script:SunshinePortOffsets).
+        "csrf_allowed_origins = https://$($Loopback):$($Port + 1)",
         "file_apps = $appsFile",
         "log_path = $(Join-Path $configDir 'sunshine.log')",
         "credentials_file = $(Join-Path $configDir 'sunshine_state.json')",
