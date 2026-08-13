@@ -10,6 +10,7 @@ $script:PortStart = 47989
 $script:PortEnd = 48050
 $script:RdpHost = '127.0.0.2'
 $script:RdpPort = 3389
+$script:RdpPlusPath = 'C:\Program Files (x86)\Remote Desktop Plus\rdp.exe'
 
 
 function Set-DashboardPaths {
@@ -160,6 +161,41 @@ function Install-RdpWrapper {
     Set-RdpWrapperConfiguration
     $result = Test-RdpWrapperConfiguration
     if (-not $result.Success) { throw "RDP Wrapper verification failed: $($result.Failures -join ', ')" }
+}
+
+
+function Install-RemoteDesktopPlus {
+    <#
+        Installs Remote Desktop Plus (RDP+), the mstsc wrapper used to launch
+        fully automated RDP logins for dashboard-managed accounts. Unlike
+        mstsc.exe, rdp.exe accepts the password on the command line, so the
+        login never depends on a saved Windows Credential Manager entry.
+    #>
+    param(
+        [string]$Source = 'https://www.donkz.nl/download/remote-desktop-plus-msi/',
+        [int]$InstallTimeoutSeconds = 300
+    )
+
+    $msi = Join-Path $env:TEMP 'RemoteDesktopPlus.msi'
+    Invoke-DownloadFile -Uri $Source -Destination $msi -CacheName 'remoteDesktopPlus' | Out-Null
+
+    $logFile = Join-Path $env:TEMP 'RemoteDesktopPlus-install.log'
+    $arguments = @('/i', "`"$msi`"", '/quiet', '/qn', '/norestart', '/log', "`"$logFile`"")
+
+    Write-Host 'Installing Remote Desktop Plus...'
+    $process = Start-Process -FilePath 'msiexec.exe' -ArgumentList $arguments -PassThru
+    if (-not $process.WaitForExit($InstallTimeoutSeconds * 1000)) {
+        $process.Kill()
+        throw "Remote Desktop Plus installer did not finish within $InstallTimeoutSeconds seconds."
+    }
+    # 3010 = success, reboot required; treat it as success like the RDP Wrapper installer does.
+    if ($process.ExitCode -ne 0 -and $process.ExitCode -ne 3010) {
+        throw "Remote Desktop Plus MSI install failed with exit code $($process.ExitCode). See log at '$logFile'."
+    }
+
+    if (-not (Test-Path -LiteralPath $script:RdpPlusPath)) {
+        throw "Remote Desktop Plus installer completed but rdp.exe was not found at '$script:RdpPlusPath'."
+    }
 }
 
 
@@ -524,18 +560,27 @@ function Invoke-DashboardRdpBootstrap {
     param([Parameter(Mandatory)][string]$Username)
 
     Assert-Administrator
-    $alias = Ensure-DashboardRdpAlias -Username $Username
-    if (-not (Test-DashboardRdpCredential -Username $Username)) {
-        throw "No saved RDP credential exists for '$Username'. Create the user through the dashboard again with a password, or configure the dashboard credential first."
+    if (-not (Test-Path -LiteralPath $script:RdpPlusPath)) {
+        throw "Remote Desktop Plus was not found at '$script:RdpPlusPath'. Re-run the installer to install it."
     }
 
-    $mstsc = Join-Path $env:SystemRoot 'System32\mstsc.exe'
-    if (-not (Test-Path -LiteralPath $mstsc)) { throw "mstsc.exe was not found at '$mstsc'." }
+    # Dashboard-managed local accounts always use the username as the Windows
+    # account password (see New-DashboardUser), so the login is passed
+    # explicitly and completes with no saved-credential prompt to click
+    # through. 127.0.0.2 (not 127.0.0.1) is required: it is the loopback
+    # address RDP Wrapper uses to grant an *additional* session to an account
+    # that is already logged on, instead of reconnecting to its existing one.
+    $arguments = @(
+        "/v:$($script:RdpHost):$($script:RdpPort)",
+        "/u:.\$Username",
+        "/p:$Username",
+        '/w:1920',
+        '/h:1080'
+    )
 
-    # Bootstrap a real RDP session at exactly 1920x1080. The saved credential
-    # is supplied by Windows Credential Manager; no password is placed on the
-    # mstsc command line.
-    Start-Process -FilePath $mstsc -ArgumentList @("/v:${alias}:3389",'/w:1920','/h:1080') | Out-Null
+    Write-Host "Starting Remote Desktop Plus for '$Username' at 1920x1080."
+    Start-Process -FilePath $script:RdpPlusPath -ArgumentList $arguments | Out-Null
+
     $session = Wait-DashboardRdpSession -Username $Username -TimeoutSeconds 30
     if ($null -eq $session) {
         throw "RDP login for '$Username' did not produce an active RDP session within 30 seconds."
@@ -591,85 +636,25 @@ function Get-DashboardState {
 
 function Save-DashboardState { param([hashtable]$State) $State | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $script:StateFile -Encoding UTF8 }
 
-function Test-BlankPasswordRdpPolicy {
-    $value = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name 'LimitBlankPasswordUse' -ErrorAction SilentlyContinue).LimitBlankPasswordUse
-    [pscustomobject]@{ AllowsBlankPasswordRdp = ($value -eq 0); PolicyValue = $value }
-}
-
-function Get-DashboardRdpAlias {
-    param([Parameter(Mandatory)][string]$Username)
-    $safe = ($Username -replace '[^a-zA-Z0-9-]', '-')
-    return "msd-$safe.rdp.local"
-}
-
-function Ensure-DashboardRdpAlias {
-    param([Parameter(Mandatory)][string]$Username)
-    Assert-Administrator
-    $alias = Get-DashboardRdpAlias -Username $Username
-    $hosts = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
-    $lines = @(Get-Content -LiteralPath $hosts -ErrorAction Stop)
-
-    # RDP Wrapper only grants a distinct, additional session for an account
-    # that is already logged on (instead of just reconnecting to its
-    # existing session) when the connection targets the second loopback
-    # address ($script:RdpHost, 127.0.0.2) rather than 127.0.0.1. The alias
-    # must resolve there, or Start/Connect RDP never produce a new session
-    # and time out even though a manual connect to 127.0.0.2 works fine.
-    $pattern = '^\s*' + [regex]::Escape($script:RdpHost) + '\s+' + [regex]::Escape($alias) + '(?:\s|$)'
-    $stalePattern = '^\s*(?!' + [regex]::Escape($script:RdpHost) + '\s)\S+\s+' + [regex]::Escape($alias) + '(?:\s|$)'
-    if ($lines -match $stalePattern) {
-        $lines = $lines | Where-Object { $_ -notmatch $stalePattern }
-        Set-Content -LiteralPath $hosts -Value $lines
-    }
-    if (-not ($lines -match $pattern)) {
-        Add-Content -LiteralPath $hosts -Value "`r`n$($script:RdpHost) $alias"
-        ipconfig /flushdns | Out-Null
-    }
-    return $alias
-}
-
-function Set-DashboardRdpCredential {
-    param(
-        [Parameter(Mandatory)][string]$Username,
-        [Parameter(Mandatory)][AllowEmptyString()][string]$Password,
-        [string]$AccountName
-    )
-
-    Assert-Administrator
-    if ([string]::IsNullOrWhiteSpace($AccountName)) { $AccountName = ".\$Username" }
-    $alias = Ensure-DashboardRdpAlias -Username $Username
-    $target = "TERMSRV/$alias"
-    & cmdkey.exe "/delete:$target" 2>$null | Out-Null
-    & cmdkey.exe "/generic:$target" "/user:$AccountName" "/pass:$Password" | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        throw "Unable to store the RDP credential for '$Username' in Windows Credential Manager."
-    }
-}
-
-function Test-DashboardRdpCredential {
-    param([string]$Username)
-    if ([string]::IsNullOrWhiteSpace($Username)) { return $false }
-    $alias = Get-DashboardRdpAlias -Username $Username
-    $output = @(cmdkey.exe "/list:TERMSRV/$alias" 2>$null)
-    return (($output -join "`n") -match [regex]::Escape("TERMSRV/$alias"))
-}
-
 function New-DashboardUser {
-    param([Parameter(Mandatory)][string]$Username, [string]$Password, [switch]$AllowBlankPasswordPolicyChange)
+    <#
+        Dashboard-managed accounts always get the username as their Windows
+        account password. Start/Connect RDP (Invoke-DashboardRdpBootstrap)
+        depend on this: they pass /p:$Username to Remote Desktop Plus for a
+        fully automated login, so the account's real password must match.
+        If -Password is supplied and differs from -Username, the account is
+        still created with that password, but automated RDP login for it
+        will fail until the password is reset to match the username.
+    #>
+    param([Parameter(Mandatory)][string]$Username, [string]$Password)
     Assert-Administrator
-    if ([string]::IsNullOrEmpty($Password)) {
-        $policy = Test-BlankPasswordRdpPolicy
-        if (-not $policy.AllowsBlankPasswordRdp) {
-            if (-not $AllowBlankPasswordPolicyChange) { throw 'Blank password RDP logon is blocked by Windows policy. Re-run with explicit AllowBlankPasswordPolicyChange after warning the operator.' }
-            Write-Warning 'Changing LimitBlankPasswordUse weakens Windows security by permitting blank-password remote logon.'
-            New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name 'LimitBlankPasswordUse' -Value 0 -PropertyType DWord -Force | Out-Null
-        }
-        net user $Username /add | Out-Null
-    } else {
-        net user $Username $Password /add | Out-Null
+    if ([string]::IsNullOrEmpty($Password)) { $Password = $Username }
+    if ($Password -ne $Username) {
+        Write-Warning "'$Username' is being created with a password that does not match the username. Start/Connect RDP auto sign-in requires the account password to equal the username; automated RDP login will fail until it is reset to match."
     }
+
+    net user $Username $Password /add | Out-Null
     net localgroup 'Remote Desktop Users' $Username /add | Out-Null
-    if (-not [string]::IsNullOrEmpty($Password)) { Set-DashboardRdpCredential -Username $Username -Password $Password -AccountName ".\$Username" }
 
     $userRoot = Join-Path $script:UsersRoot $Username
     New-DirectoryIfMissing -Path $userRoot
@@ -821,9 +806,10 @@ function Test-DashboardInstallation {
         'Moonlight downloaded' = (Test-Path -LiteralPath (Join-Path $script:InstallRoot 'Stream\Moonlight\Moonlight.exe'))
         'Sunshine downloaded' = (Test-Path -LiteralPath (Join-Path $script:InstallRoot 'Stream\Sunshine\Sunshine.exe'))
         'tscon available' = (Test-TsconAvailable)
+        'Remote Desktop Plus installed' = (Test-Path -LiteralPath $script:RdpPlusPath)
         'Dashboard installed' = (Test-Path -LiteralPath (Join-Path $script:InstallRoot 'Dashboard.ps1'))
     }
     $checks.GetEnumerator() | ForEach-Object { [pscustomobject]@{ Check=$_.Key; Passed=[bool]$_.Value } }
 }
 
-Export-ModuleMember -Function *-Dashboard*,Install-*,Test-*,New-DashboardUser,Start-DashboardSession,Stop-DashboardSession,Connect-DashboardRdp,Keep-Alive-DashboardRdp,Connect-DashboardMoonlight,Assert-Administrator,Set-DashboardPaths,Invoke-RdpWrapperInstaller,Get-RdpEndpoint,Get-DashboardState,Get-RemoteDesktopUsers,Get-UserSession,Get-UserSessions,Get-UserRdpSessionId,Get-UserConsoleSession,Maintain-DashboardSession,Invoke-DashboardRdpBootstrap,Set-DashboardRdpCredential,Test-DashboardRdpCredential
+Export-ModuleMember -Function *-Dashboard*,Install-*,Test-*,New-DashboardUser,Start-DashboardSession,Stop-DashboardSession,Connect-DashboardRdp,Keep-Alive-DashboardRdp,Connect-DashboardMoonlight,Assert-Administrator,Set-DashboardPaths,Invoke-RdpWrapperInstaller,Get-RdpEndpoint,Get-DashboardState,Get-RemoteDesktopUsers,Get-UserSession,Get-UserSessions,Get-UserRdpSessionId,Get-UserConsoleSession,Maintain-DashboardSession,Invoke-DashboardRdpBootstrap
