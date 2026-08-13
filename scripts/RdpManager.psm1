@@ -211,11 +211,16 @@ function global:Invoke-DashboardRdpBootstrap {
     # that have no dedicated rdp.exe CLI flag; /u: and /p: are still passed
     # on the command line since a plaintext password can't be stored in the
     # .rdp file itself.
+    # /batch is RDP+'s own documented "script mode" flag: it prevents RDP+
+    # from showing its own error messages/prompts, which is what was
+    # popping up instead of an instant, silent connect -- confirmed against
+    # RDP+'s actual documented command-line syntax (donkz.nl), not assumed.
     $rdpFile = New-DashboardRdpFile -Username $Username
     $arguments = @(
         "`"$rdpFile`"",
         "/u:.\$Username",
-        "/p:$Username"
+        "/p:$Username",
+        '/batch'
     )
 
     Write-Host "Starting Remote Desktop Plus for '$Username' at 1920x1080."
