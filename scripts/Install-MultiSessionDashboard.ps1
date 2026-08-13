@@ -62,6 +62,12 @@ Install-RemoteDesktopPlus -Source $RemoteDesktopPlusUri -InstallTimeoutSeconds $
 Write-Host 'Using native Windows tscon for RDP session handoff and Remote Desktop Plus for automated RDP login on 127.0.0.2:3389...'
 if (-not (Test-TsconAvailable)) { throw 'tscon.exe is required but was not found in System32.' }
 
+Write-Host 'Granting SeTcbPrivilege to Administrators (required for tscon to hand sessions to console)...'
+Grant-DashboardTcbPrivilege
+if (-not (Test-CurrentTokenHasTcbPrivilege)) {
+    Write-Warning "SeTcbPrivilege was granted to Administrators, but this session's own logon token does not have it yet -- log off and back on (or reboot) before using Start/Connect RDP."
+}
+
 $checks = Test-DashboardInstallation
 $checks | Format-Table -AutoSize
 $failed = @($checks | Where-Object { -not $_.Passed })

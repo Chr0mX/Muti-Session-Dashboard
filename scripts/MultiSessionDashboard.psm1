@@ -51,6 +51,100 @@ function Assert-Administrator {
     }
 }
 
+function Get-SeTcbPrivilegeSids {
+    <#
+        Reads the local security policy's current SeTcbPrivilege ("Act as
+        part of the operating system") assignment via secedit and returns
+        the raw SID/account list. Read-only; used both to check whether the
+        Administrators group already has it and, in Grant-DashboardTcbPrivilege,
+        to merge into rather than clobber whatever's already assigned.
+    #>
+    $exportPath = Join-Path $env:TEMP ("msd-secpol-export-" + [guid]::NewGuid().ToString('N') + '.inf')
+    try {
+        & secedit /export /cfg $exportPath /areas USER_RIGHTS | Out-Null
+        if (-not (Test-Path -LiteralPath $exportPath)) {
+            throw 'secedit /export did not produce a policy file.'
+        }
+        $line = Get-Content -LiteralPath $exportPath | Where-Object { $_ -match '^\s*SeTcbPrivilege\s*=' } | Select-Object -First 1
+        if (-not $line -or $line -notmatch '=\s*(.*)$') { return @() }
+        return @($matches[1] -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    } finally {
+        Remove-Item -LiteralPath $exportPath -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-DashboardTcbPrivilegeGranted {
+    <#
+        Policy-level check: does the local security policy grant
+        SeTcbPrivilege to BUILTIN\Administrators (S-1-5-32-544)? This can be
+        true while the *current* process's own token still lacks it -- see
+        Test-CurrentTokenHasTcbPrivilege for that, separate, check.
+    #>
+    return ((Get-SeTcbPrivilegeSids) -contains '*S-1-5-32-544')
+}
+
+function Test-CurrentTokenHasTcbPrivilege {
+    <#
+        Token-level check: does *this* process's own logon token carry
+        SeTcbPrivilege right now? Granting the policy only affects new logon
+        tokens, so an operator who was already logged in when the grant
+        happened needs to log off/on (or reboot) before tscon actually works
+        for them -- whoami /priv omits a privilege entirely (not merely
+        'Disabled') when the token doesn't hold it at all.
+    #>
+    $priv = & whoami /priv 2>$null
+    return (($priv -join "`n") -match '(?im)^SeTcbPrivilege\s')
+}
+
+function Grant-DashboardTcbPrivilege {
+    <#
+        tscon requires the caller to hold SeTcbPrivilege to hand a session
+        to console without a password prompt, and to displace whoever
+        currently occupies the destination session -- a hard requirement
+        for Start/Connect RDP's console hand-off, not an edge case. Local
+        Administrators do not hold it by default. Grants it to
+        BUILTIN\Administrators via a local security policy update
+        (secedit), merging into whatever accounts already hold it rather
+        than replacing them. Idempotent: a no-op if already granted.
+
+        IMPORTANT: this only affects new logon tokens. An operator already
+        logged in when this runs must log off/on (or reboot) before tscon
+        will work for them -- the policy change alone does not upgrade an
+        existing session's token.
+    #>
+    if (Test-DashboardTcbPrivilegeGranted) {
+        Write-Host 'SeTcbPrivilege is already granted to Administrators.'
+        return
+    }
+
+    $existingSids = Get-SeTcbPrivilegeSids
+    $allSids = @($existingSids + '*S-1-5-32-544' | Select-Object -Unique)
+
+    $importPath = Join-Path $env:TEMP ("msd-secpol-import-" + [guid]::NewGuid().ToString('N') + '.inf')
+    $dbPath = Join-Path $env:TEMP ("msd-secpol-" + [guid]::NewGuid().ToString('N') + '.sdb')
+    try {
+        $content = @(
+            '[Unicode]'
+            'Unicode=yes'
+            '[Version]'
+            'signature="$CHICAGO$"'
+            'Revision=1'
+            '[Privilege Rights]'
+            "SeTcbPrivilege = $($allSids -join ',')"
+        ) -join "`r`n"
+        Set-Content -LiteralPath $importPath -Value $content -Encoding Unicode
+
+        $result = & secedit /configure /db $dbPath /cfg $importPath /areas USER_RIGHTS 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "secedit failed to grant SeTcbPrivilege to Administrators (exit $LASTEXITCODE): $result"
+        }
+    } finally {
+        Remove-Item -LiteralPath $importPath, $dbPath -ErrorAction SilentlyContinue
+    }
+
+    Write-Warning 'Granted SeTcbPrivilege ("Act as part of the operating system") to Administrators so tscon can hand sessions to console. This only applies to NEW logon tokens: log off and back on (or reboot), then relaunch the dashboard, before Start/Connect RDP will work.'
+}
+
 function New-DirectoryIfMissing {
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) {
@@ -1108,6 +1202,9 @@ function Start-DashboardSession {
     if (-not (Test-Path -LiteralPath $sunshineExe)) {
         throw "Sunshine is not installed for '$Username'. Create the user through the dashboard so Initialize-UserSunshine can run first."
     }
+    if (-not (Test-CurrentTokenHasTcbPrivilege)) {
+        throw "This session's logon token does not hold SeTcbPrivilege, which tscon needs to hand a session to console. The installer grants this to Administrators, but only new logon tokens pick it up -- log off and back on (or reboot), then relaunch the dashboard, before using Start."
+    }
 
     # 1) Create a real 1920x1080 RDP login for the selected user via Remote
     #    Desktop Plus. If this doesn't produce an Active RDP session in time,
@@ -1245,6 +1342,7 @@ function Test-DashboardInstallation {
         'Moonlight downloaded' = (Test-Path -LiteralPath (Join-Path $script:InstallRoot 'Stream\Moonlight\Moonlight.exe'))
         'Sunshine downloaded' = (Test-Path -LiteralPath (Join-Path $script:InstallRoot 'Stream\Sunshine\Sunshine.exe'))
         'tscon available' = (Test-TsconAvailable)
+        'SeTcbPrivilege granted to Administrators' = (Test-DashboardTcbPrivilegeGranted)
         'Remote Desktop Plus installed' = (Test-Path -LiteralPath (Resolve-RemoteDesktopPlusPath))
         'Dashboard installed' = (Test-Path -LiteralPath (Join-Path $script:InstallRoot 'Dashboard.ps1'))
     }
