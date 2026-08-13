@@ -40,6 +40,9 @@ param(
     [string[]]$SunshineAssetNamePatterns = @('(?i)^sunshine-windows-portable\.zip$', '(?i)^sunshine-windows.*portable.*\.zip$', '(?i)^sunshine.*windows.*portable.*\.zip$', '(?i)^sunshine.*portable.*windows.*\.zip$'),
     [string]$RemoteDesktopPlusUri = 'https://www.donkz.nl/download/remote-desktop-plus-msi/',
     [int]$RemoteDesktopPlusInstallTimeoutSeconds = 300,
+    [string]$ViGEmBusUri = 'https://github.com/nefarius/ViGEmBus/releases/download/v1.22.0/ViGEmBus_1.22.0_x64_x86_arm64.exe',
+    [string[]]$ViGEmBusInstallArguments = @('/quiet', '/norestart'),
+    [int]$ViGEmBusInstallTimeoutSeconds = 300,
     [switch]$RefreshDownloadCache
 )
 
@@ -77,6 +80,9 @@ try {
         -SunshineAssetNamePatterns $SunshineAssetNamePatterns `
         -RemoteDesktopPlusUri $RemoteDesktopPlusUri `
         -RemoteDesktopPlusInstallTimeoutSeconds $RemoteDesktopPlusInstallTimeoutSeconds `
+        -ViGEmBusUri $ViGEmBusUri `
+        -ViGEmBusInstallArguments $ViGEmBusInstallArguments `
+        -ViGEmBusInstallTimeoutSeconds $ViGEmBusInstallTimeoutSeconds `
         -RefreshDownloadCache
 } finally {
     Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue

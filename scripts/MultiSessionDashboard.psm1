@@ -358,6 +358,51 @@ function Install-RemoteDesktopPlus {
     }
 }
 
+function Test-ViGEmBusInstalled {
+    return ($null -ne (Get-Service -Name 'ViGEmBus' -ErrorAction SilentlyContinue))
+}
+
+function Install-ViGEmBus {
+    <#
+        Installs the ViGEmBus virtual gamepad emulation driver. Sunshine
+        requires it for Moonlight gamepad/controller passthrough; without
+        it, Sunshine logs "Fatal: ViGEmBus is not installed or running. You
+        must install ViGEmBus for gamepad support!" and streams with no
+        controller support at all. The installer is a signed WiX Burn
+        bootstrapper, so it takes the same /quiet /norestart convention as
+        the other WiX-based installers in this module.
+    #>
+    param(
+        [string]$Source = 'https://github.com/nefarius/ViGEmBus/releases/download/v1.22.0/ViGEmBus_1.22.0_x64_x86_arm64.exe',
+        [string[]]$InstallArguments = @('/quiet', '/norestart'),
+        [int]$InstallTimeoutSeconds = 300
+    )
+
+    if (Test-ViGEmBusInstalled) {
+        Write-Host 'ViGEmBus is already installed.'
+        return
+    }
+
+    $installer = Join-Path $env:TEMP 'ViGEmBusSetup.exe'
+    Invoke-DownloadFile -Uri $Source -Destination $installer -CacheName 'vigembus' | Out-Null
+
+    Write-Host 'Installing ViGEmBus...'
+    $process = Start-Process -FilePath $installer -ArgumentList $InstallArguments -PassThru
+    if (-not $process.WaitForExit($InstallTimeoutSeconds * 1000)) {
+        $process.Kill()
+        throw "ViGEmBus installer did not finish within $InstallTimeoutSeconds seconds."
+    }
+    # 3010 = success, reboot required; same convention as the other
+    # installers in this module (RDP Wrapper, Remote Desktop Plus).
+    if ($process.ExitCode -ne 0 -and $process.ExitCode -ne 3010) {
+        throw "ViGEmBus installer exited with code $($process.ExitCode)."
+    }
+
+    if (-not (Test-ViGEmBusInstalled)) {
+        throw 'ViGEmBus installer completed but the ViGEmBus service/driver was not found afterward. A reboot may be required for the driver to register; re-run the installer after rebooting to confirm.'
+    }
+}
+
 function Resolve-RemoteDesktopPlusPath {
     <#
         Confirms rdp.exe's location rather than only ever assuming the
@@ -1396,6 +1441,7 @@ function Test-DashboardInstallation {
         'tscon available' = (Test-TsconAvailable)
         'SeTcbPrivilege granted to Administrators' = (Test-DashboardTcbPrivilegeGranted)
         'Remote Desktop Plus installed' = (Test-Path -LiteralPath (Resolve-RemoteDesktopPlusPath))
+        'ViGEmBus installed' = (Test-ViGEmBusInstalled)
         'Dashboard installed' = (Test-Path -LiteralPath (Join-Path $script:InstallRoot 'Dashboard.ps1'))
     }
     $checks.GetEnumerator() | ForEach-Object { [pscustomobject]@{ Check=$_.Key; Passed=[bool]$_.Value } }

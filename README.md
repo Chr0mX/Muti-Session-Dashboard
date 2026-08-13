@@ -66,6 +66,8 @@ RDP Wrapper is installed with the upstream-supported console argument `-install`
 
 Moonlight and Sunshine downloads are resolved from `https://api.github.com/repos/moonlight-stream/moonlight-qt/releases/latest` and `https://api.github.com/repos/LizardByte/Sunshine/releases/latest`, then matched against portable Windows ZIP asset name patterns before downloading.
 
+[ViGEmBus](https://github.com/nefarius/ViGEmBus) is also installed — Sunshine requires it for Moonlight gamepad/controller passthrough; without it, streaming works but no controller input does.
+
 The installer caches dependency archives under `C:\Program Files\Muti Session Dashboard\Config\Downloads` and reuses them on later runs, so repeated installs do not re-download files unnecessarily. Use `-RefreshDownloadCache` to clear the cache before installing.
 
 The installer fails closed: if any required dependency cannot be downloaded, configured, or verified, it reports the failed checks and does not mark installation complete. If the network is unavailable but a valid cached archive exists, the installer uses the cached archive and continues verification.

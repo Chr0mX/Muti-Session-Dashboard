@@ -19,6 +19,9 @@ param(
     [string[]]$SunshineAssetNamePatterns = @('(?i)^sunshine-windows-portable\.zip$', '(?i)^sunshine-windows.*portable.*\.zip$', '(?i)^sunshine.*windows.*portable.*\.zip$', '(?i)^sunshine.*portable.*windows.*\.zip$'),
     [string]$RemoteDesktopPlusUri = 'https://www.donkz.nl/download/remote-desktop-plus-msi/',
     [int]$RemoteDesktopPlusInstallTimeoutSeconds = 300,
+    [string]$ViGEmBusUri = 'https://github.com/nefarius/ViGEmBus/releases/download/v1.22.0/ViGEmBus_1.22.0_x64_x86_arm64.exe',
+    [string[]]$ViGEmBusInstallArguments = @('/quiet', '/norestart'),
+    [int]$ViGEmBusInstallTimeoutSeconds = 300,
     [switch]$RefreshDownloadCache
 )
 
@@ -58,6 +61,9 @@ Install-SunshinePortable -ReleaseApiUri $SunshineReleaseApiUri -AssetNamePattern
 
 Write-Host 'Installing Remote Desktop Plus...'
 Install-RemoteDesktopPlus -Source $RemoteDesktopPlusUri -InstallTimeoutSeconds $RemoteDesktopPlusInstallTimeoutSeconds
+
+Write-Host 'Installing ViGEmBus (required by Sunshine for Moonlight gamepad/controller support)...'
+Install-ViGEmBus -Source $ViGEmBusUri -InstallArguments $ViGEmBusInstallArguments -InstallTimeoutSeconds $ViGEmBusInstallTimeoutSeconds
 
 Write-Host 'Using native Windows tscon for RDP session handoff and Remote Desktop Plus for automated RDP login on 127.0.0.2:3389...'
 if (-not (Test-TsconAvailable)) { throw 'tscon.exe is required but was not found in System32.' }
