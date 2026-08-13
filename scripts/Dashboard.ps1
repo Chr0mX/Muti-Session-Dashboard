@@ -133,15 +133,30 @@ function Refresh-Grid {
 function Update-SessionMonitor {
     try {
         $state = Get-DashboardState
-        foreach ($key in @($state.Keys)) {
+
+        # Poll every Remote Desktop Users member's actual Windows session state,
+        # not just the ones the dashboard itself started. This is what makes a
+        # manual RDP connection (outside the dashboard) show up correctly, and
+        # it keeps tscon handoff working for those sessions too.
+        $users = @(Get-RemoteDesktopUsers)
+        foreach ($user in $users) {
+            $key = [string]$user.Username
+            if ([string]::IsNullOrWhiteSpace($key)) { continue }
+            if (-not $state.ContainsKey($key)) {
+                $state[$key] = @{
+                    Username=$key; AccountName=$user.AccountName; SunshinePort=$null;
+                    SessionState='Stopped'; SunshineState='Stopped';
+                    RdpSessionId=$null; RdpConnectionStatus='Disconnected'
+                }
+            }
             $entry = $state[$key]
-            if ($null -eq $entry -or $entry.SessionState -ne 'Running') { continue }
 
             try {
                 $session = Maintain-DashboardSession -Username $key
                 if ($null -eq $session) {
-                    $entry.SessionState = 'Offline'
+                    $entry.RdpSessionId = $null
                     $entry.RdpConnectionStatus = 'Disconnected'
+                    if ($entry.SessionState -eq 'Running') { $entry.SessionState = 'Stopped' }
                     continue
                 }
 
