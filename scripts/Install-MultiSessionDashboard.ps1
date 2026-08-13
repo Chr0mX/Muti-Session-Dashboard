@@ -40,6 +40,17 @@ foreach ($directory in $directories) {
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Dashboard.ps1') -Destination (Join-Path $InstallRoot 'Dashboard.ps1') -Force
 Copy-Item -LiteralPath $modulePath -Destination (Join-Path $InstallRoot 'MultiSessionDashboard.psm1') -Force
 
+# MultiSessionDashboard.psm1 is only the coordinator; it loads these four
+# focused backend modules from the same directory it's running from, so
+# they need to land alongside it in the install root too.
+foreach ($backendModule in @('SessionManager.psm1', 'UserManager.psm1', 'RdpManager.psm1', 'HeadlessManager.psm1')) {
+    $source = Join-Path $PSScriptRoot $backendModule
+    if (-not (Test-Path -LiteralPath $source)) {
+        throw "Required backend module '$backendModule' was not found next to Install-MultiSessionDashboard.ps1 at '$source'."
+    }
+    Copy-Item -LiteralPath $source -Destination (Join-Path $InstallRoot $backendModule) -Force
+}
+
 Write-Host 'Installing RDP Wrapper...'
 Install-RdpWrapper -Source $RdpWrapperUri -ReleaseApiUri $RdpWrapperReleaseApiUri -AssetNamePatterns $RdpWrapperAssetNamePatterns -InstallArguments $RdpWrapperInstallArguments -InstallTimeoutSeconds $RdpWrapperInstallTimeoutSeconds
 

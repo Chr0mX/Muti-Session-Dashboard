@@ -49,7 +49,15 @@ $staging = Join-Path $env:TEMP ("MultiSessionDashboard-Install-" + [guid]::NewGu
 New-Item -ItemType Directory -Path $staging -Force | Out-Null
 
 try {
-    $files = @('MultiSessionDashboard.psm1', 'Dashboard.ps1', 'Install-MultiSessionDashboard.ps1')
+    $files = @(
+        'MultiSessionDashboard.psm1',
+        'SessionManager.psm1',
+        'UserManager.psm1',
+        'RdpManager.psm1',
+        'HeadlessManager.psm1',
+        'Dashboard.ps1',
+        'Install-MultiSessionDashboard.ps1'
+    )
     foreach ($file in $files) {
         $uri = "$RepoRawBaseUri/$file"
         $destination = Join-Path $staging $file

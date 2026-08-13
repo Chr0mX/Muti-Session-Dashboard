@@ -1,3 +1,33 @@
+<#
+    MultiSessionDashboard.psm1 -- kernel + public coordinator.
+
+    This is the one module Dashboard.ps1 and Install-MultiSessionDashboard.ps1
+    import. It owns:
+      - Shared "kernel" functions every other module depends on: install
+        paths, dashboard state persistence, admin/dir/download helpers, and
+        RDP Wrapper install/verify.
+      - Loading the four focused backend modules (SessionManager, UserManager,
+        RdpManager, HeadlessManager) and gluing them into the handful of
+        top-level workflows (Connect-DashboardRdp, Test-DashboardInstallation).
+      - Start-DashboardBackgroundTask, the async-execution helper that keeps
+        every slow operation (RDP launches, session waits, headless re-arm)
+        off the WinForms UI thread.
+
+    Every function in every one of this project's five backend files
+    (this one, RdpManager.psm1, SessionManager.psm1, HeadlessManager.psm1,
+    UserManager.psm1) is declared as `function global:Verb-Noun` instead of
+    relying on PowerShell's normal per-module Export-ModuleMember/Import-Module
+    scoping. This is a single WinForms desktop app that always loads every
+    module into one shared runspace (or, for background work, one freshly
+    Import-Module'd runspace per task) -- not a general-purpose reusable
+    library -- so plain global functions are the simplest, most robust way
+    to make every module's functions reliably callable from every other
+    module without fighting module scope boundaries or juggling import
+    order/circularity. The four backend modules are meant to be loaded
+    through this coordinator (see the bottom of this file), not imported
+    standalone.
+#>
+
 Set-StrictMode -Version Latest
 
 $script:InstallRoot = 'C:\Program Files\Muti Session Dashboard'
@@ -6,28 +36,24 @@ $script:ConfigRoot = Join-Path $script:InstallRoot 'Config'
 $script:UsersRoot = Join-Path $script:InstallRoot 'Users'
 $script:StateFile = Join-Path $script:ConfigRoot 'sessions.json'
 $script:DownloadCacheRoot = Join-Path $script:ConfigRoot 'Downloads'
-$script:RdpFileCacheRoot = Join-Path $script:ConfigRoot 'RdpFiles'
-# RDP Wrapper's concurrent multi-session support is more reliable connecting
-# through a distinct loopback address than through 127.0.0.1 -- this is kept
-# regardless of whether a session ever touches the console.
-$script:RdpHost = '127.0.0.2'
-$script:RdpPort = 3389
-$script:RdpPlusPath = 'C:\Program Files (x86)\Remote Desktop Plus\rdp.exe'
-$script:RdpWrapperManagerPath = 'C:\Program Files\RDP Wrapper\rdpWrapper_x64.exe'
-$script:RdpFileCacheRoot = $null
 
-
-function Set-DashboardPaths {
+function global:Set-DashboardPaths {
     param([Parameter(Mandatory)][string]$InstallRoot)
     $script:InstallRoot = $InstallRoot
     $script:ConfigRoot = Join-Path $script:InstallRoot 'Config'
     $script:UsersRoot = Join-Path $script:InstallRoot 'Users'
     $script:StateFile = Join-Path $script:ConfigRoot 'sessions.json'
     $script:DownloadCacheRoot = Join-Path $script:ConfigRoot 'Downloads'
-    $script:RdpFileCacheRoot = Join-Path $script:ConfigRoot 'RdpFiles'
+    if (Get-Command -Name Set-RdpManagerPaths -ErrorAction SilentlyContinue) {
+        Set-RdpManagerPaths -ConfigRoot $script:ConfigRoot
+    }
 }
 
-function Assert-Administrator {
+function global:Get-DashboardInstallRoot { return $script:InstallRoot }
+function global:Get-DashboardConfigRoot { return $script:ConfigRoot }
+function global:Get-DashboardUsersRoot { return $script:UsersRoot }
+
+function global:Assert-Administrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]::new($identity)
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -35,32 +61,30 @@ function Assert-Administrator {
     }
 }
 
-function New-DirectoryIfMissing {
+function global:New-DirectoryIfMissing {
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) {
         New-Item -ItemType Directory -Path $Path -Force | Out-Null
     }
 }
 
-function Invoke-DashboardUiPump {
+function global:Invoke-DashboardUiPump {
     <#
-        Connect-DashboardRdp's wait for the RDP session to come up runs
-        directly on Dashboard.ps1's WinForms UI thread, since its button
-        click handlers call straight into it -- so without pumping the
-        message loop during the wait, the whole window stops repainting and
-        Windows reports it as "Not Responding" for the duration. Calling
-        this once per polling iteration keeps it responsive.
-
-        Resolved by string (not a literal [System.Windows.Forms.Application]
-        type reference) so this is a safe no-op when that assembly isn't
-        loaded, e.g. when this module is used from the non-interactive
-        installer, which never loads WinForms.
+        Historically used to keep the WinForms message loop alive during a
+        blocking wait run directly on the UI thread. The dashboard no
+        longer does that -- RDP launches, session waits, and headless
+        re-arms all run on background runspaces now (see
+        Start-DashboardBackgroundTask) and marshal UI updates back via
+        Control.BeginInvoke instead. Kept only for backward compatibility /
+        any future genuinely-UI-thread wait that wants it; resolved by
+        string so it's a safe no-op when WinForms isn't loaded (e.g. from
+        the non-interactive installer, or from a background runspace).
     #>
     $appType = 'System.Windows.Forms.Application' -as [type]
     if ($appType) { $appType::DoEvents() }
 }
 
-function Get-SafeCacheFileName {
+function global:Get-SafeCacheFileName {
     param([Parameter(Mandatory)][string]$Uri, [Parameter(Mandatory)][string]$Name)
     $extension = [IO.Path]::GetExtension(([Uri]$Uri).AbsolutePath)
     if ([string]::IsNullOrWhiteSpace($extension)) { $extension = '.download' }
@@ -70,14 +94,14 @@ function Get-SafeCacheFileName {
     return "$Name-$hash$extension"
 }
 
-function Test-UsableDownload {
+function global:Test-UsableDownload {
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return $false }
     $item = Get-Item -LiteralPath $Path
     return ($item.Length -gt 0)
 }
 
-function Invoke-DownloadFile {
+function global:Invoke-DownloadFile {
     param(
         [Parameter(Mandatory)][string]$Uri,
         [Parameter(Mandatory)][string]$Destination,
@@ -116,15 +140,14 @@ function Invoke-DownloadFile {
     }
 }
 
-function Expand-ArchiveSafe {
+function global:Expand-ArchiveSafe {
     param([Parameter(Mandatory)][string]$Archive, [Parameter(Mandatory)][string]$Destination)
     if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Recurse -Force }
     New-DirectoryIfMissing -Path $Destination
     Expand-Archive -Path $Archive -DestinationPath $Destination -Force
 }
 
-
-function Invoke-RdpWrapperInstaller {
+function global:Invoke-RdpWrapperInstaller {
     param(
         [Parameter(Mandatory)][string]$FilePath,
         [Parameter(Mandatory)][string]$WorkingDirectory,
@@ -155,7 +178,7 @@ function Invoke-RdpWrapperInstaller {
     }
 }
 
-function Install-RdpWrapper {
+function global:Install-RdpWrapper {
     <#
         By default resolves the latest release through the GitHub API rather
         than only ever downloading the static '.../releases/latest/download/
@@ -211,66 +234,7 @@ function Install-RdpWrapper {
     if (-not $result.Success) { throw "RDP Wrapper verification failed: $($result.Failures -join ', ')" }
 }
 
-
-function Install-RemoteDesktopPlus {
-    <#
-        Installs Remote Desktop Plus (RDP+), the mstsc wrapper used to launch
-        fully automated RDP logins for dashboard-managed accounts. Unlike
-        mstsc.exe, rdp.exe accepts the password on the command line, so the
-        login never depends on a saved Windows Credential Manager entry.
-    #>
-    param(
-        [string]$Source = 'https://www.donkz.nl/download/remote-desktop-plus-msi/',
-        [int]$InstallTimeoutSeconds = 300
-    )
-
-    $msi = Join-Path $env:TEMP 'RemoteDesktopPlus.msi'
-    Invoke-DownloadFile -Uri $Source -Destination $msi -CacheName 'remoteDesktopPlus' | Out-Null
-
-    $logFile = Join-Path $env:TEMP 'RemoteDesktopPlus-install.log'
-    $arguments = @('/i', "`"$msi`"", '/quiet', '/qn', '/norestart', '/log', "`"$logFile`"")
-
-    Write-Host 'Installing Remote Desktop Plus...'
-    $process = Start-Process -FilePath 'msiexec.exe' -ArgumentList $arguments -PassThru
-    if (-not $process.WaitForExit($InstallTimeoutSeconds * 1000)) {
-        $process.Kill()
-        throw "Remote Desktop Plus installer did not finish within $InstallTimeoutSeconds seconds."
-    }
-    # 3010 = success, reboot required; treat it as success like the RDP Wrapper installer does.
-    if ($process.ExitCode -ne 0 -and $process.ExitCode -ne 3010) {
-        throw "Remote Desktop Plus MSI install failed with exit code $($process.ExitCode). See log at '$logFile'."
-    }
-
-    if (-not (Test-Path -LiteralPath $script:RdpPlusPath)) {
-        throw "Remote Desktop Plus installer completed but rdp.exe was not found at '$script:RdpPlusPath'."
-    }
-}
-
-function Resolve-RemoteDesktopPlusPath {
-    <#
-        Confirms rdp.exe's location rather than only ever assuming the
-        hard-coded install path: if it isn't there (a different MSI version,
-        a manual install), search both Program Files roots for it and cache
-        whatever is found for the rest of this session.
-    #>
-    if (Test-Path -LiteralPath $script:RdpPlusPath) { return $script:RdpPlusPath }
-
-    $roots = @('C:\Program Files (x86)', 'C:\Program Files') | Where-Object { Test-Path -LiteralPath $_ }
-    foreach ($root in $roots) {
-        $found = Get-ChildItem -LiteralPath $root -Filter 'rdp.exe' -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { $_.DirectoryName -like '*Remote Desktop Plus*' } |
-            Select-Object -First 1
-        if ($found) {
-            $script:RdpPlusPath = $found.FullName
-            return $script:RdpPlusPath
-        }
-    }
-
-    return $script:RdpPlusPath
-}
-
-
-function Enable-RemoteDesktopFirewallRules {
+function global:Enable-RemoteDesktopFirewallRules {
     $rules = Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
     if ($rules) {
         $rules | Enable-NetFirewallRule -ErrorAction SilentlyContinue | Out-Null
@@ -286,7 +250,7 @@ function Enable-RemoteDesktopFirewallRules {
     }
 }
 
-function Set-RdpWrapperConfiguration {
+function global:Set-RdpWrapperConfiguration {
     New-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -PropertyType DWord -Force | Out-Null
     New-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'AllowRemoteRPC' -Value 1 -PropertyType DWord -Force | Out-Null
     New-ItemProperty -Path 'HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services' -Name 'Shadow' -Value 2 -PropertyType DWord -Force | Out-Null
@@ -302,7 +266,7 @@ function Set-RdpWrapperConfiguration {
     }
 }
 
-function Test-RdpWrapperConfiguration {
+function global:Test-RdpWrapperConfiguration {
     $failures = [System.Collections.Generic.List[string]]::new()
     if (-not (Test-Path -LiteralPath $script:RdpWrapperRoot)) { $failures.Add('RDP Wrapper installed') }
     $deny = (Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -ErrorAction SilentlyContinue).fDenyTSConnections
@@ -316,8 +280,7 @@ function Test-RdpWrapperConfiguration {
     [pscustomobject]@{ Success = $failures.Count -eq 0; Failures = $failures }
 }
 
-
-function Resolve-GitHubLatestReleaseAsset {
+function global:Resolve-GitHubLatestReleaseAsset {
     param(
         [Parameter(Mandatory)][string]$ReleaseApiUri,
         [Parameter(Mandatory)][string[]]$AssetNamePatterns,
@@ -345,380 +308,7 @@ function Resolve-GitHubLatestReleaseAsset {
     throw "Could not find a $ComponentName release asset matching patterns: $($AssetNamePatterns -join ', '). Available assets: $available"
 }
 
-function Get-RemoteDesktopUsers {
-    <#
-        Returns direct members of the local "Remote Desktop Users" group.
-        Uses Get-LocalGroupMember when available and falls back to the
-        built-in Windows WinNT provider so detection works without the
-        LocalAccounts PowerShell module.
-    #>
-    $members = [System.Collections.Generic.List[object]]::new()
-    $cmd = Get-Command -Name Get-LocalGroupMember -ErrorAction SilentlyContinue
-
-    if ($null -ne $cmd) {
-        try {
-            foreach ($member in @(Get-LocalGroupMember -Group 'Remote Desktop Users' -ErrorAction Stop)) {
-                $accountName = [string]$member.Name
-                if ([string]::IsNullOrWhiteSpace($accountName)) { continue }
-
-                $displayName = $accountName
-                if ($displayName -match '^[^\\]+\\(.+)$') { $displayName = $matches[1] }
-
-                $members.Add([pscustomobject]@{
-                    Username        = $displayName
-                    AccountName     = $accountName
-                    PrincipalSource = [string]$member.PrincipalSource
-                    ObjectClass     = [string]$member.ObjectClass
-                })
-            }
-            return @($members | Sort-Object Username, AccountName -Unique)
-        }
-        catch {
-            Write-Verbose "Get-LocalGroupMember failed; falling back to WinNT provider. $($_.Exception.Message)"
-        }
-    }
-
-    try {
-        $group = [ADSI]'WinNT://./Remote Desktop Users,group'
-        foreach ($member in @($group.psbase.Invoke('Members'))) {
-            try {
-                $accountName = [string]$member.GetType().InvokeMember(
-                    'Name', [System.Reflection.BindingFlags]::GetProperty, $null, $member, $null)
-
-                if ([string]::IsNullOrWhiteSpace($accountName)) { continue }
-
-                $className = ''
-                $adsPath = ''
-                try {
-                    $className = [string]$member.GetType().InvokeMember(
-                        'Class', [System.Reflection.BindingFlags]::GetProperty, $null, $member, $null)
-                } catch {}
-                try {
-                    $adsPath = [string]$member.GetType().InvokeMember(
-                        'ADsPath', [System.Reflection.BindingFlags]::GetProperty, $null, $member, $null)
-                } catch {}
-
-                $displayName = $accountName
-                $qualifiedName = $accountName
-
-                if ($adsPath -match '^WinNT://([^/]+)/(.+)$') {
-                    $displayName = $matches[2]
-                    $qualifiedName = "$($matches[1])\$($matches[2])"
-                }
-
-                $source = 'Unknown'
-                if ($qualifiedName -match '^([^\\]+)\\') { $source = $matches[1] }
-
-                $members.Add([pscustomobject]@{
-                    Username        = $displayName
-                    AccountName     = $qualifiedName
-                    PrincipalSource = $source
-                    ObjectClass     = $className
-                })
-            }
-            catch {
-                Write-Verbose "Could not read one Remote Desktop Users member: $($_.Exception.Message)"
-            }
-        }
-    }
-    catch {
-        throw "Could not read members of the local 'Remote Desktop Users' group. $($_.Exception.Message)"
-    }
-
-    return @($members | Sort-Object Username, AccountName -Unique)
-}
-
-function Get-DashboardUsers {
-    # Sync dashboard state with the current Remote Desktop Users group.
-    $state = Get-DashboardState
-    $users = @(Get-RemoteDesktopUsers)
-
-    foreach ($user in $users) {
-        if (-not $state.ContainsKey($user.Username)) {
-            $state[$user.Username] = Get-DefaultDashboardStateEntry -Username $user.Username -AccountName $user.AccountName
-        } else {
-            $state[$user.Username].Username = $user.Username
-            $state[$user.Username].AccountName = $user.AccountName
-        }
-    }
-
-    Save-DashboardState -State $state
-    return $users
-}
-
-function Get-RdpEndpoint {
-    return "$($script:RdpHost):$($script:RdpPort)"
-}
-
-function Add-DashboardWtsApiType {
-    <#
-        Registers the Win32 WTS (Windows Terminal Services) session
-        enumeration API via P/Invoke. Get-AllUserSessions prefers this over
-        parsing quser's fixed-width text output: quser has been observed to
-        report a session that is genuinely Active (confirmed independently
-        via `query session`) as not found at all when its column layout
-        doesn't match the parsing regex exactly for that Windows build, or
-        when it is invoked without a real attached console (as happens when
-        PowerShell is launched non-interactively, e.g. from a GUI process).
-        WTSEnumerateSessions/WTSQuerySessionInformation is the same API
-        `quser`/`query session` themselves call internally, without the text
-        round-trip that makes parsing fragile.
-    #>
-    if ('BetterRdp.Wts' -as [type]) { return }
-    Add-Type -Namespace BetterRdp -Name Wts -MemberDefinition @'
-[DllImport("wtsapi32.dll", SetLastError = true)]
-public static extern IntPtr WTSOpenServer(string pServerName);
-
-[DllImport("wtsapi32.dll")]
-public static extern void WTSCloseServer(IntPtr hServer);
-
-[DllImport("wtsapi32.dll", SetLastError = true)]
-public static extern bool WTSEnumerateSessions(IntPtr hServer, int Reserved, int Version, out IntPtr ppSessionInfo, out int pCount);
-
-[DllImport("wtsapi32.dll")]
-public static extern void WTSFreeMemory(IntPtr pMemory);
-
-[DllImport("wtsapi32.dll", SetLastError = true)]
-public static extern bool WTSQuerySessionInformation(IntPtr hServer, int sessionId, int wtsInfoClass, out IntPtr ppBuffer, out int pBytesReturned);
-
-[StructLayout(LayoutKind.Sequential)]
-public struct WTS_SESSION_INFO {
-    public int SessionId;
-    [MarshalAs(UnmanagedType.LPStr)]
-    public string pWinStationName;
-    public int State;
-}
-'@ -UsingNamespace 'System.Runtime.InteropServices'
-}
-
-function Get-AllUserSessions {
-    <#
-        Enumerates every Terminal Services session on this machine (all
-        users, not just one) via the WTS API -- the primary, reliable
-        source Get-UserSessions filters against. Falls back to parsing
-        `quser` text output only if the WTS call itself fails outright
-        (e.g. wtsapi32.dll unavailable), since a fragile text parse is
-        still better than no data at all.
-    #>
-    $results = [System.Collections.Generic.List[object]]::new()
-    try {
-        Add-DashboardWtsApiType
-        $server = [IntPtr]::Zero  # local server
-        $sessionInfoPtr = [IntPtr]::Zero
-        $count = 0
-        $ok = [BetterRdp.Wts]::WTSEnumerateSessions($server, 0, 1, [ref]$sessionInfoPtr, [ref]$count)
-        if (-not $ok) { throw "WTSEnumerateSessions failed (Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))." }
-
-        try {
-            $structSize = [Runtime.InteropServices.Marshal]::SizeOf([type]'BetterRdp.Wts+WTS_SESSION_INFO')
-            for ($i = 0; $i -lt $count; $i++) {
-                $current = [IntPtr]::Add($sessionInfoPtr, $i * $structSize)
-                $info = [Runtime.InteropServices.Marshal]::PtrToStructure($current, [type]'BetterRdp.Wts+WTS_SESSION_INFO')
-
-                # WTSUserName = 5, WTSConnectState is already on $info.State
-                $userPtr = [IntPtr]::Zero; $userBytes = 0
-                $username = ''
-                if ([BetterRdp.Wts]::WTSQuerySessionInformation($server, $info.SessionId, 5, [ref]$userPtr, [ref]$userBytes)) {
-                    try { $username = [Runtime.InteropServices.Marshal]::PtrToStringAnsi($userPtr) }
-                    finally { [BetterRdp.Wts]::WTSFreeMemory($userPtr) }
-                }
-                if ([string]::IsNullOrWhiteSpace($username)) { continue }
-
-                # WTS_CONNECTSTATE_CLASS: 0=Active 1=Connected 2=ConnectQuery
-                # 3=Shadow 4=Disconnected 5=Idle 6=Listen 7=Reset 8=Down 9=Init
-                $stateName = switch ($info.State) {
-                    0 { 'Active' }
-                    1 { 'Connected' }
-                    4 { 'Disc' }
-                    5 { 'Idle' }
-                    default { 'Other' }
-                }
-                $sessionName = [string]$info.pWinStationName
-
-                $results.Add([pscustomobject]@{
-                    Username    = $username
-                    SessionId   = $info.SessionId
-                    SessionName = $sessionName
-                    State       = $stateName
-                    Online      = ($info.State -eq 0 -or $info.State -eq 1)
-                    IsRdp       = ($sessionName -like 'RDP-Tcp*')
-                    IsConsole   = ($sessionName -ieq 'Console')
-                })
-            }
-        } finally {
-            if ($sessionInfoPtr -ne [IntPtr]::Zero) { [BetterRdp.Wts]::WTSFreeMemory($sessionInfoPtr) }
-        }
-        return @($results)
-    } catch {
-        Write-Verbose "WTS session enumeration failed; falling back to quser text parsing. $($_.Exception.Message)"
-    }
-
-    # Fallback: parse `quser`'s fixed-width text output. Kept only as a
-    # last resort -- see Add-DashboardWtsApiType's comment for why this is
-    # not the primary path.
-    foreach ($line in @(quser 2>$null)) {
-        $text = [string]$line
-        if ($text -match '^\s*>?\s*(\S+)(?:\s+(\S+))?\s+(\d+)\s+(\S+)') {
-            $user = $matches[1]; $sessionName = if ($matches[2] -match '^rdp-tcp|^console$') { $matches[2] } else { '' }; $id = [int]$matches[3]; $state = $matches[4]
-            $results.Add([pscustomobject]@{ Username=$user; SessionId=$id; SessionName=$sessionName; State=$state; Online=($state -match '^(Active|Conn)$'); IsRdp=($sessionName -like 'rdp-tcp*'); IsConsole=($sessionName -ieq 'console') })
-        }
-    }
-    return @($results)
-}
-
-function Get-UserSessions {
-    param([Parameter(Mandatory)][string]$Username)
-    return @(Get-AllUserSessions | Where-Object { $_.Username -ieq $Username })
-}
-
-function Get-UserSession {
-    param([Parameter(Mandatory)][string]$Username)
-    $sessions = @(Get-UserSessions -Username $Username)
-    if ($sessions.Count -eq 0) { return $null }
-    $console = $sessions | Where-Object { $_.IsConsole -and $_.Online } | Select-Object -First 1
-    if ($null -ne $console) { return $console }
-    $active = $sessions | Where-Object { $_.Online } | Select-Object -First 1
-    if ($null -ne $active) { return $active }
-    return ($sessions | Select-Object -First 1)
-}
-
-function Get-UserRdpSessionId {
-    param([Parameter(Mandatory)][string]$Username)
-    return @(Get-UserSessions -Username $Username | Where-Object { $_.IsRdp } | Sort-Object SessionId | Select-Object -First 1)
-}
-
-function Wait-DashboardRdpSession {
-    param([Parameter(Mandatory)][string]$Username,[int]$TimeoutSeconds=30,[int[]]$IgnoreSessionIds=@())
-    $deadline=(Get-Date).AddSeconds($TimeoutSeconds)
-    do {
-        $session=@(Get-UserSessions -Username $Username | Where-Object { $_.IsRdp -and $_.State -match '^(Active|Conn)$' -and ($IgnoreSessionIds -notcontains $_.SessionId) } | Sort-Object SessionId | Select-Object -First 1)
-        if ($null -ne $session -and @($session).Count -gt 0) { return $session[0] }
-        Invoke-DashboardUiPump
-        Start-Sleep -Milliseconds 500
-    } while ((Get-Date) -lt $deadline)
-    return $null
-}
-
-function New-DashboardRdpFile {
-    <#
-        Remote Desktop Plus (rdp.exe) accepts an .rdp settings file as a
-        positional argument alongside its own /u: /p: overrides, so any
-        setting normally only available in an .rdp file -- like
-        "smart sizing:i:1" -- goes here instead of trying to invent a
-        CLI flag for it that rdp.exe doesn't have.
-    #>
-    param([Parameter(Mandatory)][string]$Username)
-
-    New-DirectoryIfMissing -Path $script:RdpFileCacheRoot
-    $path = Join-Path $script:RdpFileCacheRoot "$Username.rdp"
-    $lines = @(
-        "full address:s:$($script:RdpHost):$($script:RdpPort)"
-        "username:s:.\$Username"
-        'smart sizing:i:1'
-        'desktopwidth:i:1920'
-        'desktopheight:i:1080'
-        'screen mode id:i:1'
-        'authentication level:i:0'
-        'prompt for credentials:i:0'
-        'enablecredsspsupport:i:1'
-    )
-    Set-Content -LiteralPath $path -Value $lines -Encoding ASCII
-    return $path
-}
-
-function Invoke-DashboardRdpBootstrap {
-    <#
-        Launches a fully automated RDP login for a dashboard-managed account
-        via Remote Desktop Plus. Connecting to the SAME endpoint for a user
-        who already has a disconnected session reconnects it -- standard RDP
-        behavior -- so this doubles as both a fresh connect and any later
-        reconnect.
-
-        -Minimize is used by Start-DashboardHeadlessLoopback to arm a
-        background/anchor connection that keeps the session alive without
-        an RDP window sitting in the operator's way; a later interactive
-        Connect-DashboardRdp call reconnects the same session with a new,
-        visible client, which displaces (disconnects) the minimized one
-        automatically -- standard RDP behavior, not something this script
-        has to orchestrate itself.
-    #>
-    param([Parameter(Mandatory)][string]$Username, [switch]$Minimize)
-
-    Assert-Administrator
-    $rdpPlusPath = Resolve-RemoteDesktopPlusPath
-    if (-not (Test-Path -LiteralPath $rdpPlusPath)) {
-        throw "Remote Desktop Plus was not found at '$rdpPlusPath'. Re-run the installer to install it."
-    }
-
-    # Dashboard-managed local accounts always use the username as the Windows
-    # account password (see New-DashboardUser), so the login is passed
-    # explicitly and completes with no saved-credential prompt to click
-    # through. The generated .rdp file carries settings (like smart sizing)
-    # that have no dedicated rdp.exe CLI flag; /u: and /p: are still passed
-    # on the command line since a plaintext password can't be stored in the
-    # .rdp file itself.
-    $rdpFile = New-DashboardRdpFile -Username $Username
-    $arguments = @(
-        "`"$rdpFile`"",
-        "/u:.\$Username",
-        "/p:$Username"
-    )
-
-    Write-Host "Starting Remote Desktop Plus for '$Username' at 1920x1080."
-    $process = Start-Process -FilePath $rdpPlusPath -ArgumentList $arguments -PassThru
-
-    # 45s, not 30s: a first-ever logon (profile creation, GPU/driver init)
-    # can genuinely take longer than 30s.
-    $session = Wait-DashboardRdpSession -Username $Username -TimeoutSeconds 45
-    if ($null -eq $session) {
-        throw "RDP login for '$Username' did not produce an active RDP session within 45 seconds. Run 'query session' to check whether it actually connected -- if it shows Active, this is a detection issue rather than a failed login."
-    }
-
-    if ($Minimize) { Set-DashboardWindowMinimized -ProcessId $process.Id }
-
-    return [pscustomobject]@{
-        Username  = $session.Username
-        SessionId = $session.SessionId
-        ProcessId = $process.Id
-    }
-}
-
-function Set-DashboardWindowMinimized {
-    <#
-        Best-effort minimize of an rdp.exe process's main window, used to
-        keep an "armed" headless loopback connection out of the operator's
-        way. A brand-new process's main window handle isn't available
-        immediately, so this polls briefly for it. Failure here is
-        non-fatal -- the RDP session itself is what matters; a window that
-        couldn't be minimized is just a cosmetic miss.
-    #>
-    param([Parameter(Mandatory)][int]$ProcessId, [int]$TimeoutSeconds = 10)
-
-    if (-not ('BetterRdp.Window' -as [type])) {
-        Add-Type -Namespace BetterRdp -Name Window -MemberDefinition @'
-[DllImport("user32.dll")]
-public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-'@ -UsingNamespace 'System.Runtime.InteropServices'
-    }
-    $SW_MINIMIZE = 6
-
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    do {
-        try {
-            $proc = Get-Process -Id $ProcessId -ErrorAction Stop
-            $proc.Refresh()
-            if ($proc.MainWindowHandle -ne [IntPtr]::Zero) {
-                [BetterRdp.Window]::ShowWindow($proc.MainWindowHandle, $SW_MINIMIZE) | Out-Null
-                return
-            }
-        } catch {
-            return
-        }
-        Start-Sleep -Milliseconds 250
-    } while ((Get-Date) -lt $deadline)
-}
-
-function ConvertTo-HashtableRecursive {
+function global:ConvertTo-HashtableRecursive {
     param([Parameter(ValueFromPipeline)]$InputObject)
     process {
         if ($null -eq $InputObject) { return $null }
@@ -740,7 +330,7 @@ function ConvertTo-HashtableRecursive {
     }
 }
 
-function Get-DefaultDashboardStateEntry {
+function global:Get-DefaultDashboardStateEntry {
     <#
         The single source of truth for a state entry's full key set. Used
         both for brand-new entries and by Repair-DashboardStateEntry to
@@ -773,7 +363,7 @@ function Get-DefaultDashboardStateEntry {
     }
 }
 
-function Repair-DashboardStateEntry {
+function global:Repair-DashboardStateEntry {
     <#
         Set-StrictMode -Version Latest throws "property ... cannot be found"
         on dot-access to a hashtable key that simply isn't there -- so an
@@ -781,8 +371,8 @@ function Repair-DashboardStateEntry {
         time anything reads it that way. Back-fill any missing keys with
         their default value so every entry always has the full current
         shape, regardless of when it was first created. Fields from a
-        previous schema (e.g. the old Sunshine-related keys) are left in
-        place, just unused -- nothing here strips them.
+        previous schema are left in place, just unused -- nothing here
+        strips them.
     #>
     param([Parameter(Mandatory)][hashtable]$Entry, [Parameter(Mandatory)][string]$Username)
     $accountName = if ($Entry.ContainsKey('AccountName')) { $Entry['AccountName'] } else { $null }
@@ -793,7 +383,7 @@ function Repair-DashboardStateEntry {
     return $Entry
 }
 
-function Get-DashboardState {
+function global:Get-DashboardState {
     New-DirectoryIfMissing -Path $script:ConfigRoot
     if (-not (Test-Path -LiteralPath $script:StateFile)) { return @{} }
     $json = Get-Content -LiteralPath $script:StateFile -Raw
@@ -806,109 +396,27 @@ function Get-DashboardState {
     return $state
 }
 
-function Save-DashboardState { param([hashtable]$State) $State | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $script:StateFile -Encoding UTF8 }
+function global:Save-DashboardState { param([hashtable]$State) $State | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $script:StateFile -Encoding UTF8 }
 
-function New-DashboardUser {
+function global:Connect-DashboardRdp {
     <#
-        Dashboard-managed accounts always get the username as their Windows
-        account password. Connect-DashboardRdp depends on this: it passes
-        /p:$Username to Remote Desktop Plus for a fully automated login, so
-        the account's real password must match. If -Password is supplied
-        and differs from -Username, the account is still created with that
-        password, but automated RDP login for it will fail until the
-        password is reset to match the username.
-    #>
-    param([Parameter(Mandatory)][string]$Username, [string]$Password)
-    Assert-Administrator
-    if ([string]::IsNullOrEmpty($Password)) { $Password = $Username }
-    if ($Password -ne $Username) {
-        Write-Warning "'$Username' is being created with a password that does not match the username. Connect RDP auto sign-in requires the account password to equal the username; automated RDP login will fail until it is reset to match."
-    }
+        CONNECT workflow: launch (or reconnect) the selected user's RDP
+        session as a real, visible, interactive client. If a headless
+        loopback connection was armed for this user, connecting again to
+        the same session displaces it automatically -- standard RDP
+        behavior, reconnecting to an existing session disconnects whichever
+        client held it before. The stale headless rdp.exe window (if it
+        didn't already close on its own) is cleaned up afterward.
 
-    net user $Username $Password /add | Out-Null
-    net localgroup 'Remote Desktop Users' $Username /add | Out-Null
+        The rest of the CONNECT workflow -- waiting for the interactive
+        client to actually close and then re-arming a fresh headless
+        loopback -- happens in Update-DashboardMonitorState, which already
+        runs on its own background runspace on every monitor tick, so it
+        naturally continues watching this session after this function
+        returns without blocking anything here.
 
-    $userRoot = Join-Path $script:UsersRoot $Username
-    New-DirectoryIfMissing -Path $userRoot
-}
-
-function Assert-DashboardConnectPreconditions {
-    param([Parameter(Mandatory)][string]$Username)
-    $knownUsers = @(Get-RemoteDesktopUsers | ForEach-Object { $_.Username })
-    if ($knownUsers -notcontains $Username) {
-        throw "'$Username' is not a member of the local 'Remote Desktop Users' group."
-    }
-    $wrapperCheck = Test-RdpWrapperConfiguration
-    if (-not $wrapperCheck.Success) {
-        throw "RDP Wrapper is not correctly configured: $($wrapperCheck.Failures -join ', ')"
-    }
-}
-
-function Stop-DashboardHeadlessLoopback {
-    <#
-        Kills a still-running headless loopback rdp.exe process for this
-        user, if any, and clears the tracking fields. Safe to call even if
-        nothing is armed. Does not sign the underlying Windows session off
-        -- that stays alive across headless -> interactive handoffs; only
-        Stop-DashboardSession does that.
-    #>
-    param([Parameter(Mandatory)][string]$Username, [hashtable]$State)
-
-    $ownState = $false
-    if ($null -eq $State) { $State = Get-DashboardState; $ownState = $true }
-    if ($State.ContainsKey($Username)) {
-        $entry = $State[$Username]
-        if ($entry.HeadlessArmed -and $entry.HeadlessProcessId) {
-            try {
-                $proc = Get-Process -Id ([int]$entry.HeadlessProcessId) -ErrorAction SilentlyContinue
-                if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
-            } catch {}
-        }
-        $entry.HeadlessArmed = $false
-        $entry.HeadlessProcessId = $null
-    }
-    if ($ownState) { Save-DashboardState -State $State }
-}
-
-function Start-DashboardHeadlessLoopback {
-    <#
-        Arms a background/anchor RDP connection for this user: the same
-        automated login as Connect-DashboardRdp, but launched minimized so
-        it never shows an RDP window on the operator's desktop. This is the
-        "Start" step in the Headless RDP Loopback flow -- it exists to keep
-        the user's session alive and ready ("HEADLESS READY"), not to be
-        looked at. A later Connect-DashboardRdp call reconnects the same
-        session with a real, visible client, which displaces this one
-        automatically (standard RDP behavior).
-    #>
-    param([Parameter(Mandatory)][string]$Username)
-    Assert-Administrator
-    Assert-DashboardConnectPreconditions -Username $Username
-
-    $rdp = Invoke-DashboardRdpBootstrap -Username $Username -Minimize
-
-    $state = Get-DashboardState
-    if ($state.ContainsKey($Username)) {
-        $state[$Username].RdpSessionId = $rdp.SessionId
-        $state[$Username].RdpConnectionStatus = 'Headless'
-        $state[$Username].SessionState = 'Armed'
-        $state[$Username].HeadlessArmed = $true
-        $state[$Username].HeadlessProcessId = $rdp.ProcessId
-        $state[$Username].StopRequested = $false
-        Save-DashboardState -State $state
-    }
-    return $rdp
-}
-
-function Connect-DashboardRdp {
-    <#
-        Launches (or reconnects) the selected user's RDP session as a real,
-        visible, interactive client. If a headless loopback connection was
-        armed for this user, connecting again to the same session displaces
-        it automatically -- standard RDP behavior, reconnecting to an
-        existing session disconnects whichever client held it before. The
-        stale headless rdp.exe window (if it didn't already close on its
-        own) is cleaned up afterward.
+        Blocks for as long as Invoke-DashboardRdpBootstrap does, so this
+        must always be run from a background runspace.
     #>
     param([Parameter(Mandatory)][string]$Username)
     Assert-Administrator
@@ -932,39 +440,83 @@ function Connect-DashboardRdp {
     return $rdp
 }
 
-function Stop-DashboardSession {
+function global:Update-DashboardMonitorState {
     <#
-        Sign the user off, and tear down any armed headless loopback
-        connection along with it.
-    #>
-    param([Parameter(Mandatory)][string]$Username)
-    $session = Get-UserSession -Username $Username
-    if ($null -ne $session) { logoff $session.SessionId 2>$null }
+        One full monitoring pass: refresh Remote Desktop Users membership,
+        poll each member's real Windows session state (via the live WTS
+        session ID, never a hard-coded one), and -- if an interactively
+        connected user's session has gone offline without an explicit Stop
+        -- wait for it to actually finish closing and then re-arm their
+        headless loopback right here.
 
+        This entire function is meant to run inside the background
+        runspace Start-DashboardBackgroundTask creates for it (see
+        Dashboard.ps1's monitor timer), so the potentially multi-second
+        wait-then-rearm never touches the UI thread. Returns the refreshed
+        state as a hashtable for the caller to render.
+    #>
     $state = Get-DashboardState
-    Stop-DashboardHeadlessLoopback -Username $Username -State $state
-    if ($state.ContainsKey($Username)) {
-        $state[$Username].SessionState = 'Stopped'
-        $state[$Username].RdpConnectionStatus = 'Disconnected'
-        $state[$Username].StopRequested = $true
+    $users = @(Get-RemoteDesktopUsers)
+
+    foreach ($user in $users) {
+        $key = [string]$user.Username
+        if ([string]::IsNullOrWhiteSpace($key)) { continue }
+        if (-not $state.ContainsKey($key)) {
+            $state[$key] = Get-DefaultDashboardStateEntry -Username $key -AccountName $user.AccountName
+        }
+        $entry = $state[$key]
+        $wasInteractive = ($entry.SessionState -eq 'Running')
+
+        try {
+            $session = Get-UserSession -Username $key
+            if ($null -eq $session) {
+                $entry.RdpSessionId = $null
+                $entry.RdpConnectionStatus = 'Disconnected'
+                if ($entry.SessionState -ne 'Stopped') { $entry.SessionState = 'Stopped' }
+            } else {
+                $entry.RdpSessionId = $session.SessionId
+                if ($session.Online) {
+                    # A headless-armed entry whose session shows Online again
+                    # with no interactive Connect having happened is just the
+                    # loopback itself; keep it Armed/Headless rather than
+                    # clobbering that state.
+                    if (-not $entry.HeadlessArmed) {
+                        $entry.RdpConnectionStatus = 'Connected'
+                        $entry.SessionState = 'Running'
+                    }
+                } else {
+                    $entry.RdpConnectionStatus = 'Disconnected'
+                }
+            }
+        } catch {
+            # Keep the monitor alive even if a single user's session
+            # temporarily cannot be queried.
+            $entry.RdpConnectionStatus = 'Error'
+        }
+
+        # CONNECT workflow, continued: once the interactive client that
+        # displaced a headless connection disconnects (session goes fully
+        # offline), wait until it has genuinely finished closing and then
+        # automatically start a fresh headless loopback so the user is
+        # HEADLESS again -- unless the operator explicitly hit Stop.
+        $justWentOffline = ($wasInteractive -and $entry.SessionState -eq 'Stopped' -and -not $entry.HeadlessArmed -and -not $entry.StopRequested)
+        if ($justWentOffline) {
+            try {
+                Wait-DashboardSessionClosed -Username $key -TimeoutSeconds 10 | Out-Null
+                Start-DashboardHeadlessLoopback -Username $key | Out-Null
+                $fresh = Get-DashboardState
+                if ($fresh.ContainsKey($key)) { $state[$key] = $fresh[$key] }
+            } catch {
+                Write-Verbose "Auto re-arm of headless loopback for '$key' failed: $($_.Exception.Message)"
+            }
+        }
     }
+
     Save-DashboardState -State $state
+    return $state
 }
 
-function Open-DashboardRdpWrapperManager {
-    <#
-        Launches the RDP Wrapper manager/config UI directly, for manual
-        inspection or reconfiguration outside the dashboard's own
-        install/verify flow.
-    #>
-    param([string]$Path = $script:RdpWrapperManagerPath)
-    if (-not (Test-Path -LiteralPath $Path)) {
-        throw "RDP Wrapper manager was not found at '$Path'."
-    }
-    Start-Process -FilePath $Path | Out-Null
-}
-
-function Test-DashboardInstallation {
+function global:Test-DashboardInstallation {
     $checks = [ordered]@{
         'RDP Wrapper installed' = (Test-Path -LiteralPath $script:RdpWrapperRoot)
         'TermWrap configured' = (Test-RdpWrapperConfiguration).Success
@@ -975,4 +527,110 @@ function Test-DashboardInstallation {
     $checks.GetEnumerator() | ForEach-Object { [pscustomobject]@{ Check=$_.Key; Passed=[bool]$_.Value } }
 }
 
-Export-ModuleMember -Function *-Dashboard*,Install-*,Test-*,New-DashboardUser,Stop-DashboardSession,Connect-DashboardRdp,Assert-Administrator,Set-DashboardPaths,Invoke-RdpWrapperInstaller,Get-RdpEndpoint,Get-DashboardState,Get-RemoteDesktopUsers,Get-UserSession,Get-UserSessions,Get-AllUserSessions,Get-UserRdpSessionId,Invoke-DashboardRdpBootstrap,Get-DefaultDashboardStateEntry,Open-DashboardRdpWrapperManager
+function global:Start-DashboardBackgroundTask {
+    <#
+        Runs a single module command (by name, with a parameter hashtable --
+        never a scriptblock, which would carry cross-runspace baggage) on
+        its own background runspace, so the WinForms UI thread is never
+        blocked by RDP launches, session waits, or headless re-arms -- all
+        of which can legitimately take several seconds up to tens of
+        seconds. This is what makes Start/Connect/Stop and the monitor tick
+        non-blocking.
+
+        Non-blocking end to end:
+          1. PowerShell.BeginInvoke() starts the command on a background
+             runspace and returns immediately.
+          2. ThreadPool.RegisterWaitForSingleObject waits for that
+             invocation's completion handle WITHOUT polling or blocking any
+             thread the caller cares about; its callback fires on a
+             ThreadPool thread once the background command finishes.
+          3. That ThreadPool-thread callback never touches WinForms
+             controls directly -- it marshals -OnSuccess/-OnError/
+             -OnComplete onto -Control's own thread via the standard,
+             thread-safe Control.BeginInvoke, which is the only supported
+             way to touch a WinForms control from a non-UI thread.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Command,
+        [hashtable]$Params = @{},
+        # Deliberately untyped (not [System.Windows.Forms.Control]): this
+        # module must be importable from the non-interactive installer,
+        # which never loads System.Windows.Forms, and a strict WinForms
+        # type constraint here would fail to resolve at module-load time in
+        # that context. $Control is expected to be a WinForms Control (or
+        # anything else exposing IsHandleCreated/BeginInvoke) -- PowerShell
+        # method calls are late-bound, so this works without the static type.
+        [Parameter(Mandatory)]$Control,
+        [scriptblock]$OnSuccess = {},
+        [scriptblock]$OnError = {},
+        [scriptblock]$OnComplete = {}
+    )
+
+    $moduleRoot = $script:InstallRoot
+    # Prefer the actual module file's own directory (works from a local
+    # checkout too, not just an installed copy) so background runspaces
+    # resolve the same MultiSessionDashboard.psm1 this coordinator is
+    # already running from.
+    if ($PSScriptRoot) { $moduleRoot = $PSScriptRoot }
+
+    $runspace = [runspacefactory]::CreateRunspace()
+    $runspace.ApartmentState = [System.Threading.ApartmentState]::MTA
+    $runspace.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::ReuseThread
+    $runspace.Open()
+
+    $ps = [powershell]::Create()
+    $ps.Runspace = $runspace
+    [void]$ps.AddScript({
+        param($ModuleRoot, $Command, $Params)
+        Import-Module (Join-Path $ModuleRoot 'MultiSessionDashboard.psm1') -Force
+        & $Command @Params
+    })
+    [void]$ps.AddArgument($moduleRoot)
+    [void]$ps.AddArgument($Command)
+    [void]$ps.AddArgument($Params)
+
+    $asyncResult = $ps.BeginInvoke()
+
+    $onWaitComplete = {
+        param($state, $timedOut)
+        try {
+            $output = $ps.EndInvoke($asyncResult)
+            if ($ps.Streams.Error.Count -gt 0) { throw $ps.Streams.Error[0].Exception }
+            $items = @($output)
+            $result = if ($items.Count -eq 1) { $items[0] } elseif ($items.Count -eq 0) { $null } else { $items }
+            if ($Control.IsHandleCreated) {
+                $Control.BeginInvoke([Action]{ & $OnSuccess $result }) | Out-Null
+            }
+        } catch {
+            $message = $_.Exception.Message
+            if ($Control.IsHandleCreated) {
+                $Control.BeginInvoke([Action]{ & $OnError $message }) | Out-Null
+            }
+        } finally {
+            if ($Control.IsHandleCreated) {
+                $Control.BeginInvoke([Action]{ & $OnComplete }) | Out-Null
+            }
+            $ps.Dispose()
+            $runspace.Dispose()
+        }
+    }
+
+    $waitCallback = [System.Threading.WaitOrTimerCallback]$onWaitComplete
+    [void][System.Threading.ThreadPool]::RegisterWaitForSingleObject(
+        $asyncResult.AsyncWaitHandle, $waitCallback, $null, [System.Threading.Timeout]::Infinite, $true)
+}
+
+# Load the four focused backend modules. One direction only (coordinator ->
+# managers) to avoid any Import-Module circularity: none of the four ever
+# import this file or each other. -Global makes their exported functions
+# available process-wide immediately, on top of each already using
+# `function global:` internally -- belt and suspenders, since either alone
+# is sufficient given this project's single-runspace-per-process model (see
+# this file's header comment).
+$managerModules = @('SessionManager.psm1', 'UserManager.psm1', 'RdpManager.psm1', 'HeadlessManager.psm1')
+foreach ($manager in $managerModules) {
+    $managerPath = if ($PSScriptRoot) { Join-Path $PSScriptRoot $manager } else { Join-Path $script:InstallRoot $manager }
+    Import-Module $managerPath -Force -Global
+}
+
+Export-ModuleMember -Function *

@@ -75,7 +75,17 @@ $form.Controls.Add($status)
 
 
 
+# This dashboard runs every RDP launch, session wait, and headless re-arm on
+# a background runspace (Start-DashboardBackgroundTask, in
+# MultiSessionDashboard.psm1) so none of them ever block this UI thread or
+# the WinForms message loop. Everything below this point is presentation
+# only: it decides what a button click or a monitor tick dispatches, and
+# how the result gets painted -- it holds no session-management logic of
+# its own. $script:DashboardActionInProgress still exists so the monitor
+# timer skips a tick while a foreground button action is in flight, exactly
+# as before.
 $script:DashboardActionInProgress = $false
+$script:MonitorTaskInFlight = $false
 
 function Set-Status([string]$Text) { $status.Text = $Text; $form.Refresh() }
 
@@ -88,6 +98,10 @@ function Get-SelectedUsername {
 }
 
 function Refresh-Grid {
+    # Local group membership + reading sessions.json are fast, local, non-
+    # blocking calls (no RDP launch, no session wait) -- unlike Start/
+    # Connect/Stop and the monitor tick, this stays a plain synchronous UI
+    # action, same as before.
     try {
         $users = @(Get-RemoteDesktopUsers)
         $dashboardUsers = @(Get-DashboardUsers)
@@ -124,116 +138,67 @@ function Refresh-Grid {
     }
 }
 
-function Update-SessionMonitor {
-    # Invoke-DashboardAction's Wait-DashboardRdpSession polling pumps the
-    # WinForms message loop internally so the window stays responsive, which
-    # means this timer's own Tick can fire while an action is still
-    # mid-flight. Skip this tick rather than let it read/write sessions.json
-    # concurrently with the in-flight action's own state calls.
-    if ($script:DashboardActionInProgress) { return }
-    try {
-        $state = Get-DashboardState
-
-        # Poll every Remote Desktop Users member's actual Windows session
-        # state, not just the ones the dashboard itself connected -- this is
-        # what makes a manual RDP connection (outside the dashboard) show up
-        # correctly too. Purely a status reflection: nothing here acts on
-        # the session (no console hand-off), each user just keeps their own
-        # ordinary RDP session, reconnecting to it the normal way.
-        $users = @(Get-RemoteDesktopUsers)
-        foreach ($user in $users) {
-            $key = [string]$user.Username
-            if ([string]::IsNullOrWhiteSpace($key)) { continue }
-            if (-not $state.ContainsKey($key)) {
-                $state[$key] = Get-DefaultDashboardStateEntry -Username $key -AccountName $user.AccountName
-            }
-            $entry = $state[$key]
-            $wasInteractive = ($entry.SessionState -eq 'Running')
-
-            try {
-                $session = Get-UserSession -Username $key
-                if ($null -eq $session) {
-                    $entry.RdpSessionId = $null
-                    $entry.RdpConnectionStatus = 'Disconnected'
-                    if ($entry.SessionState -ne 'Stopped') { $entry.SessionState = 'Stopped' }
-                } else {
-                    $entry.RdpSessionId = $session.SessionId
-                    if ($session.Online) {
-                        # A headless-armed entry whose session shows Online
-                        # again with no interactive Connect having happened
-                        # is just the loopback itself reconnecting; treat it
-                        # as still armed rather than clobbering that state.
-                        if (-not $entry.HeadlessArmed) {
-                            $entry.RdpConnectionStatus = 'Connected'
-                            $entry.SessionState = 'Running'
-                        }
-                    } else {
-                        $entry.RdpConnectionStatus = 'Disconnected'
-                    }
-                }
-            } catch {
-                # Keep the dashboard alive even if a single user's session
-                # temporarily cannot be queried.
-                $entry.RdpConnectionStatus = 'Error'
-            }
-
-            # Headless RDP Loopback re-arm: once the interactive client that
-            # displaced a headless connection disconnects (session goes
-            # fully offline), automatically start a fresh headless loopback
-            # so the user is HEADLESS READY again for the next Connect,
-            # exactly as the flow requires -- no operator action needed.
-            $justWentOffline = ($wasInteractive -and $entry.SessionState -eq 'Stopped' -and -not $entry.HeadlessArmed -and -not $entry.StopRequested)
-            if ($justWentOffline) {
-                $script:DashboardActionInProgress = $true
-                try {
-                    Start-DashboardHeadlessLoopback -Username $key | Out-Null
-                    $entry = $state[$key]
-                } catch {
-                    Write-Verbose "Auto re-arm of headless loopback for '$key' failed: $($_.Exception.Message)"
-                } finally {
-                    $script:DashboardActionInProgress = $false
-                }
-            }
-        }
-        Save-DashboardState -State $state
-        # Update existing rows in place so the user's selection is not lost.
-        foreach ($row in $grid.Rows) {
-            $name = [string]$row.Cells['Username'].Value
-            if ([string]::IsNullOrWhiteSpace($name) -or -not $state.ContainsKey($name)) { continue }
-            $entry = $state[$name]
-            $row.Cells['RdpSessionId'].Value = $entry.RdpSessionId
-            $row.Cells['SessionState'].Value = $entry.SessionState
-            $row.Cells['RdpConnectionStatus'].Value = $entry.RdpConnectionStatus
-        }
-    } catch {
-        # Timer errors must never terminate the GUI.
+function Set-DashboardGridFromState {
+    # Updates existing rows in place from an already-computed state
+    # hashtable (as returned by Update-DashboardMonitorState), so the
+    # user's current row selection is never disturbed. Pure rendering --
+    # no session-management decisions happen here, those already happened
+    # in the background task that produced $State.
+    param([hashtable]$State)
+    if ($null -eq $State) { return }
+    foreach ($row in $grid.Rows) {
+        $name = [string]$row.Cells['Username'].Value
+        if ([string]::IsNullOrWhiteSpace($name) -or -not $State.ContainsKey($name)) { continue }
+        $entry = $State[$name]
+        $row.Cells['RdpSessionId'].Value = $entry.RdpSessionId
+        $row.Cells['SessionState'].Value = $entry.SessionState
+        $row.Cells['RdpConnectionStatus'].Value = $entry.RdpConnectionStatus
     }
 }
 
-function Invoke-DashboardAction([scriptblock]$Action, [string]$Success) {
-    # Connect RDP can block for tens of seconds inside $Action
-    # (Wait-DashboardRdpSession polling), which pumps the WinForms message
-    # loop internally (Invoke-DashboardUiPump) so the window doesn't appear
-    # to hang. Pumping means input messages - including another button's
-    # click - CAN be processed while $Action is still running, so disable
-    # every action button here to make that reentrant click a no-op instead
-    # of a second action racing the first.
+function Invoke-DashboardMonitorTick {
+    # Fires every 2 seconds from $sessionTimer. Dispatches the entire
+    # monitoring pass -- including any headless re-arm it decides to do --
+    # to a background runspace via Start-DashboardBackgroundTask, so a
+    # re-arm's own RDP wait can never freeze this window. Skips a tick
+    # while a foreground action is in flight (same guard as before) or
+    # while a previous monitor tick's background task hasn't finished yet,
+    # so ticks never pile up on top of each other.
+    if ($script:DashboardActionInProgress -or $script:MonitorTaskInFlight) { return }
+    $script:MonitorTaskInFlight = $true
+
+    Start-DashboardBackgroundTask -Command 'Update-DashboardMonitorState' -Control $form `
+        -OnSuccess { param($Result) Set-DashboardGridFromState -State $Result } `
+        -OnError { param($ErrorMessage) Write-Verbose "Monitor tick failed: $ErrorMessage" } `
+        -OnComplete { $script:MonitorTaskInFlight = $false }
+}
+
+function Invoke-DashboardActionAsync {
+    <#
+        Runs a module command that can legitimately block for seconds (RDP
+        launch/wait, sign-off + verify) on a background runspace, keeping
+        the UI fully responsive throughout. Buttons are disabled for the
+        duration -- same UX as before -- but the window itself never stops
+        repainting or reports "Not Responding", because nothing here runs
+        on this thread.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Command,
+        [Parameter(Mandatory)][hashtable]$Params,
+        [Parameter(Mandatory)][string]$Success
+    )
     $actionButtons = @($create, $start, $rdp, $stop, $refresh, $openWrapper)
     foreach ($button in $actionButtons) { $button.Enabled = $false }
     $script:DashboardActionInProgress = $true
-    $form.Refresh()
+    if ($Params.ContainsKey('Username')) { Set-Status "Working on $($Params.Username)..." } else { Set-Status 'Working...' }
 
-    try {
-        & $Action
-        Set-Status $Success
-        Refresh-Grid
-    } catch {
-        Set-Status $_.Exception.Message
-        [Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Multi Session Dashboard') | Out-Null
-    } finally {
-        $script:DashboardActionInProgress = $false
-        foreach ($button in $actionButtons) { $button.Enabled = $true }
-    }
+    Start-DashboardBackgroundTask -Command $Command -Params $Params -Control $form `
+        -OnSuccess { Set-Status $Success; Refresh-Grid } `
+        -OnError { param($ErrorMessage) Set-Status $ErrorMessage; [Windows.Forms.MessageBox]::Show($ErrorMessage, 'Multi Session Dashboard') | Out-Null } `
+        -OnComplete {
+            $script:DashboardActionInProgress = $false
+            foreach ($button in $actionButtons) { $button.Enabled = $true }
+        }
 }
 
 
@@ -254,9 +219,7 @@ $create.Add_Click({
 
     # Dashboard accounts use the username as the initial Windows password.
     # Example: local1 -> password local1.
-    $password = $username
-
-    Invoke-DashboardAction { New-DashboardUser -Username $username -Password $password } "Created $username (password set to username)"
+    Invoke-DashboardActionAsync -Command 'New-DashboardUser' -Params @{ Username = $username; Password = $username } -Success "Created $username (password set to username)"
 
 })
 
@@ -272,11 +235,11 @@ $start.Location = New-Object Drawing.Point(155, 370)
 
 $start.Size = New-Object Drawing.Size(100, 36)
 
-# Headless RDP Loopback: arms a background/anchor RDP connection so the
-# user's session comes up and stays "HEADLESS READY" without an RDP window
-# ever appearing. Connect below reconnects the same session interactively,
+# START workflow: arm a background/anchor RDP connection so the user's
+# session comes up and stays "HEADLESS" without an RDP window ever
+# appearing. Connect below reconnects the same session interactively,
 # which displaces this automatically -- standard RDP behavior.
-$start.Add_Click({ Invoke-DashboardAction { Start-DashboardHeadlessLoopback -Username (Get-SelectedUsername) } 'Headless loopback armed' })
+$start.Add_Click({ Invoke-DashboardActionAsync -Command 'Start-DashboardHeadlessLoopback' -Params @{ Username = (Get-SelectedUsername) } -Success 'Headless loopback armed' })
 
 $form.Controls.Add($start)
 
@@ -290,7 +253,7 @@ $rdp.Location = New-Object Drawing.Point(263, 370)
 
 $rdp.Size = New-Object Drawing.Size(120, 36)
 
-$rdp.Add_Click({ Invoke-DashboardAction { Connect-DashboardRdp -Username (Get-SelectedUsername) } 'RDP connected' })
+$rdp.Add_Click({ Invoke-DashboardActionAsync -Command 'Connect-DashboardRdp' -Params @{ Username = (Get-SelectedUsername) } -Success 'RDP connected' })
 
 $form.Controls.Add($rdp)
 
@@ -304,7 +267,7 @@ $stop.Location = New-Object Drawing.Point(391, 370)
 
 $stop.Size = New-Object Drawing.Size(90, 36)
 
-$stop.Add_Click({ Invoke-DashboardAction { Stop-DashboardSession -Username (Get-SelectedUsername) } 'Session stopped' })
+$stop.Add_Click({ Invoke-DashboardActionAsync -Command 'Stop-DashboardSession' -Params @{ Username = (Get-SelectedUsername) } -Success 'Session stopped' })
 
 $form.Controls.Add($stop)
 
@@ -332,7 +295,7 @@ $openWrapper.Location = New-Object Drawing.Point(587, 370)
 
 $openWrapper.Size = New-Object Drawing.Size(160, 36)
 
-$openWrapper.Add_Click({ Invoke-DashboardAction { Open-DashboardRdpWrapperManager } 'RDP Wrapper manager opened' })
+$openWrapper.Add_Click({ Invoke-DashboardActionAsync -Command 'Open-DashboardRdpWrapperManager' -Params @{} -Success 'RDP Wrapper manager opened' })
 
 $form.Controls.Add($openWrapper)
 
@@ -340,10 +303,12 @@ $form.Controls.Add($openWrapper)
 
 # Poll Windows sessions continuously so the grid reflects real state,
 # including RDP connections made outside the dashboard (e.g. a manual
-# mstsc/rdp.exe connection) -- pure status reflection, no session hand-off.
+# mstsc/rdp.exe connection). Each tick's actual work runs in the background
+# (see Invoke-DashboardMonitorTick) -- this timer only ever decides
+# whether to dispatch one, never blocks itself.
 $sessionTimer = New-Object Windows.Forms.Timer
 $sessionTimer.Interval = 2000
-$sessionTimer.Add_Tick({ Update-SessionMonitor })
+$sessionTimer.Add_Tick({ Invoke-DashboardMonitorTick })
 $sessionTimer.Start()
 
 Refresh-Grid
