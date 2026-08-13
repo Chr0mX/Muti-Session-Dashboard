@@ -331,6 +331,20 @@ $form.Controls.Add($refresh)
 
 
 
+$updateSunshine = New-Object Windows.Forms.Button
+
+$updateSunshine.Text = 'Update Sunshine'
+
+$updateSunshine.Location = New-Object Drawing.Point(840, 370)
+
+$updateSunshine.Size = New-Object Drawing.Size(140, 36)
+
+$updateSunshine.Add_Click({ Invoke-DashboardAction { Update-DashboardUserSunshine -Username (Get-SelectedUsername) } 'Sunshine updated' })
+
+$form.Controls.Add($updateSunshine)
+
+
+
 # Poll Windows sessions continuously. This makes tscon a lifecycle handoff:
 # Start -> RDP login -> tscon to console; Connect RDP -> GUI remains connected;
 # when the RDP client disconnects, the monitor detects the disconnected RDP

@@ -17,6 +17,21 @@ $script:ComponentVersionsFile = Join-Path $script:ConfigRoot 'component-versions
 # start at .3. See Get-AllocatedLoopback.
 $script:SunshineLoopbackStartOctet = 3
 
+# Sunshine's 'port' config value is the base of a fixed *family* of ports,
+# each offset from it by a documented, unconfigurable amount -- not a single
+# port. See https://docs.lizardbyte.dev/projects/sunshine/master/md_docs_2configuration.html
+$script:SunshinePortOffsets = [ordered]@{
+    Https   = -5  # TCP
+    Http    = 0   # TCP -- the configured 'port' value itself
+    Web     = 1   # TCP
+    Video   = 9   # UDP
+    Control = 10  # UDP
+    Audio   = 11  # UDP
+    Mic     = 13  # UDP (unused)
+    Rtsp    = 21  # TCP
+}
+$script:SunshineUdpPortNames = @('Video', 'Control', 'Audio', 'Mic')
+
 
 function Set-DashboardPaths {
     param([Parameter(Mandatory)][string]$InstallRoot)
@@ -716,10 +731,28 @@ function New-DashboardUser {
     Initialize-UserSunshine -Username $Username
 }
 
-function Initialize-UserSunshine {
-    param([Parameter(Mandatory)][string]$Username)
+function Install-UserSunshineFiles {
+    <#
+        Copies the current master Sunshine install into a user's per-user
+        directory and (re)writes their config/apps.json/Startup shortcut.
+        Shared by Initialize-UserSunshine (new user) and
+        Update-DashboardUserSunshine (existing user, e.g. after a newer
+        Sunshine release was installed) so both stay in sync.
+    #>
+    param([Parameter(Mandatory)][string]$Username, [switch]$ReservePort)
+
     $master = Join-Path $script:InstallRoot 'Stream\Sunshine'
-    if (-not (Test-Path -LiteralPath (Join-Path $master 'Sunshine.exe'))) { throw 'Master Sunshine installation is missing.' }
+    if (-not (Test-Path -LiteralPath (Join-Path $master 'sunshine.exe'))) {
+        throw 'Master Sunshine installation is missing. Run the installer to install/update it first.'
+    }
+
+    # Stop any running copy first so an in-use sunshine.exe doesn't block the
+    # copy; it comes back automatically at the user's next logon (Startup
+    # folder) or the next time the operator Starts/reconnects the session.
+    Get-Process -Name 'Sunshine' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -like "C:\Users\$Username\AppData\Local\Muti Session Dashboard\Sunshine\*" } |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+
     $profile = Join-Path 'C:\Users' $Username
     $dest = Join-Path $profile 'AppData\Local\Muti Session Dashboard\Sunshine'
     New-DirectoryIfMissing -Path $dest
@@ -727,29 +760,94 @@ function Initialize-UserSunshine {
     $configDir = Join-Path $profile 'AppData\Local\Muti Session Dashboard\Config'
     New-DirectoryIfMissing -Path $configDir
 
-    # The loopback address is reserved permanently here (unlike the port,
-    # which is only tentatively previewed now and actually reserved/released
-    # per Start/Stop cycle): Moonlight pairs per-host, so giving a user a
-    # stable address avoids forcing every user to re-pair on each session.
+    # The loopback address is reserved permanently (unlike the port, which is
+    # only tentatively previewed for a brand-new user and actually
+    # reserved/released per Start/Stop cycle): Moonlight pairs per-host, so
+    # giving a user a stable address avoids forcing a re-pair every session.
     $loopback = Get-AllocatedLoopback -Username $Username -Reserve
-    $port = Get-AllocatedPort -Username $Username -Reserve:$false
+    $port = Get-AllocatedPort -Username $Username -Reserve:$ReservePort -Loopback $loopback
     Set-UserSunshineConfig -Username $Username -Port $port -Loopback $loopback
     New-UserSunshineAppsConfig -Username $Username
     Set-UserSunshineAutoStart -Username $Username
+
+    return [pscustomobject]@{ Username = $Username; Port = $port; Loopback = $loopback }
+}
+
+function Initialize-UserSunshine {
+    param([Parameter(Mandatory)][string]$Username)
+    Install-UserSunshineFiles -Username $Username -ReservePort:$false | Out-Null
+}
+
+function Update-DashboardUserSunshine {
+    <#
+        Installs/updates Sunshine for an already-created dashboard user --
+        e.g. after Install-SunshinePortable has pulled a newer release into
+        the master copy, this pushes it out to an existing user without
+        recreating their Windows account. Re-copies the executable/assets
+        and refreshes sunshine.conf/the Startup-folder shortcut; apps.json
+        is left alone if it already exists, so an operator's own app-list
+        customization survives an update.
+    #>
+    param([Parameter(Mandatory)][string]$Username)
+    Assert-Administrator
+
+    $knownUsers = @(Get-RemoteDesktopUsers | ForEach-Object { $_.Username })
+    if ($knownUsers -notcontains $Username) {
+        throw "'$Username' is not a member of the local 'Remote Desktop Users' group. Create the user first."
+    }
+
+    $result = Install-UserSunshineFiles -Username $Username -ReservePort
+
+    $versions = Get-ComponentVersions
+    $sunshineVersion = if ($versions.ContainsKey('Sunshine')) { $versions['Sunshine'].Version } else { 'unknown' }
+    Write-Host "Sunshine updated for '$Username' (release $sunshineVersion, port $($result.Port), loopback $($result.Loopback))."
+    return $result
 }
 
 function Get-AllocatedPort {
-    param([Parameter(Mandatory)][string]$Username, [switch]$Reserve)
+    <#
+        Sunshine's 'port' is the base of a fixed *family* of ports (see the
+        $script:SunshinePortOffsets table), not a single port -- e.g. two
+        users whose base ports are only 1 apart collide, because the first
+        user's Web port (base+1) lands on the second user's HTTP port
+        (base+0). Every offset is checked against real listeners, not just
+        the bare base value, or "no collision on the base port" would be a
+        false negative.
+
+        Each user's own loopback address (bind_address, see
+        Get-AllocatedLoopback) already isolates its whole port family from
+        every other dashboard-managed user -- a listening socket is
+        (address, port), not port alone -- so pass -Loopback once it's known
+        for a check that also catches something else already listening on
+        that specific address, on top of the shared-address check below.
+    #>
+    param([Parameter(Mandatory)][string]$Username, [switch]$Reserve, [string]$Loopback)
     $state = Get-DashboardState
     if ($state.ContainsKey($Username) -and $state[$Username].SunshinePort) { return [int]$state[$Username].SunshinePort }
     $used = @($state.Values | ForEach-Object { if ($_.SunshinePort) { [int]$_.SunshinePort } })
+
+    $addresses = @('0.0.0.0', '127.0.0.1', '::', '::1')
+    if (-not [string]::IsNullOrWhiteSpace($Loopback)) { $addresses += $Loopback }
+
     foreach ($port in $script:PortStart..$script:PortEnd) {
         if ($used -contains $port) { continue }
-        # Never probe 127.0.0.1 with Test-NetConnection. If a local process is
-        # already listening, Get-NetTCPConnection can identify the collision
-        # without opening a connection or waiting for a response.
-        $listener = Get-NetTCPConnection -LocalAddress '0.0.0.0','127.0.0.1','::','::1' -LocalPort $port -State Listen -ErrorAction SilentlyContinue
-        if ($null -ne $listener) { continue }
+
+        $collision = $false
+        foreach ($name in $script:SunshinePortOffsets.Keys) {
+            $candidate = $port + $script:SunshinePortOffsets[$name]
+            if ($candidate -lt 1 -or $candidate -gt 65535) { continue }
+            # Never probe with Test-NetConnection. Get-NetTCPConnection /
+            # Get-NetUDPEndpoint identify an existing listener without
+            # opening a connection or waiting for a response.
+            if ($script:SunshineUdpPortNames -contains $name) {
+                $listener = Get-NetUDPEndpoint -LocalAddress $addresses -LocalPort $candidate -ErrorAction SilentlyContinue
+            } else {
+                $listener = Get-NetTCPConnection -LocalAddress $addresses -LocalPort $candidate -State Listen -ErrorAction SilentlyContinue
+            }
+            if ($null -ne $listener) { $collision = $true; break }
+        }
+        if ($collision) { continue }
+
         if ($Reserve) {
             if ($state.ContainsKey($Username)) {
                 # Update in place -- replacing the whole entry here would
@@ -959,8 +1057,8 @@ function Start-DashboardSession {
     #    would run it as the elevated dashboard/operator account instead of
     #    the target user. Poll for the real, verified state instead of
     #    trusting that launching it worked.
-    $port = Get-AllocatedPort -Username $Username -Reserve
     $loopback = Get-AllocatedLoopback -Username $Username -Reserve
+    $port = Get-AllocatedPort -Username $Username -Reserve -Loopback $loopback
     Set-UserSunshineConfig -Username $Username -Port $port -Loopback $loopback
 
     $deadline = (Get-Date).AddSeconds(20)
