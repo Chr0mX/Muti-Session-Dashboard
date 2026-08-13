@@ -1363,14 +1363,14 @@ function Connect-DashboardMoonlight {
 }
 
 function Stop-DashboardSession {
+    <#
+        Keep this simple: sign the user off. Logging off terminates every
+        process in their session, including Sunshine, so there's no need to
+        separately hunt down and kill it.
+    #>
     param([Parameter(Mandatory)][string]$Username)
-    Get-Process -Name 'Sunshine' -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "C:\Users\$Username\AppData\Local\Muti Session Dashboard\Sunshine\*" } | Stop-Process -Force
-
-    # Stop explicitly terminates the user's session; tscon is only used to
-    # detach an RDP session without logging it off.
-    $session = Get-UserRdpSessionId -Username $Username
+    $session = Get-UserSession -Username $Username
     if ($null -ne $session) { logoff $session.SessionId 2>$null }
-    else { logoff $Username 2>$null }
 
     $state = Get-DashboardState
     if ($state.ContainsKey($Username)) {
