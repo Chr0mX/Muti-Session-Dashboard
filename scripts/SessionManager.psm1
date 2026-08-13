@@ -25,6 +25,13 @@
 
 Set-StrictMode -Version Latest
 
+# Diagnostic state for Get-DashboardSessionSourceInfo -- must exist from
+# module load, not just after Get-AllUserSessions first runs, since
+# Set-StrictMode throws on reading an unset $script: variable even inside
+# an `if ($script:X)` truthiness check.
+$script:LastSessionSource = $null
+$script:LastSessionSourceError = $null
+
 function global:Add-DashboardWtsApiType {
     <#
         Registers the Win32 WTS (Windows Terminal Services) session
@@ -63,7 +70,15 @@ public struct WTS_SESSION_INFO {
     public string pWinStationName;
     public int State;
 }
-'@ -UsingNamespace 'System.Runtime.InteropServices'
+'@
+    # No -UsingNamespace here: Add-Type -MemberDefinition already includes
+    # `using System.Runtime.InteropServices;` in its generated wrapper by
+    # default (that mode exists specifically for P/Invoke declarations), so
+    # passing it again used to make every single call to this function
+    # fail to compile with CS0105 ("using directive ... appeared
+    # previously") -- confirmed by reproducing it in isolation. That
+    # silently sent every session query down the quser text-parsing
+    # fallback instead of the WTS API this function exists for.
 }
 
 function global:Get-AllUserSessions {
@@ -125,9 +140,26 @@ function global:Get-AllUserSessions {
         } finally {
             if ($sessionInfoPtr -ne [IntPtr]::Zero) { [BetterRdp.Wts]::WTSFreeMemory($sessionInfoPtr) }
         }
+        # Record which path actually produced data, and reset any stale
+        # failure note from a previous call -- Get-DashboardSessionSourceInfo
+        # lets a caller that hits an unexpected empty/missing result find
+        # out, after the fact, whether WTS genuinely ran or silently fell
+        # back, without having to pass -Verbose through a background
+        # runspace (which nothing here does).
+        $script:LastSessionSource = 'WTS'
+        $script:LastSessionSourceError = $null
         return @($results)
     } catch {
-        Write-Verbose "WTS session enumeration failed; falling back to quser text parsing. $($_.Exception.Message)"
+        # This used to be Write-Verbose, which is invisible by default --
+        # including inside the background runspaces every RDP
+        # connect/wait/monitor pass now runs in, so a silent fallback here
+        # was never actually seen by anyone. Write-Warning surfaces in the
+        # PowerShell host's normal error/warning stream even from a
+        # background runspace's captured streams, and the message is also
+        # stashed for Get-DashboardSessionSourceInfo to report on-demand.
+        $script:LastSessionSource = 'quser-fallback'
+        $script:LastSessionSourceError = $_.Exception.Message
+        Write-Warning "WTS session enumeration failed; falling back to quser text parsing. $($_.Exception.Message)"
     }
 
     # Fallback: parse `quser`'s fixed-width text output. Kept only as a
@@ -141,6 +173,21 @@ function global:Get-AllUserSessions {
         }
     }
     return @($results)
+}
+
+function global:Get-DashboardSessionSourceInfo {
+    <#
+        Reports whether the most recent Get-AllUserSessions call was
+        served by the primary WTS API path or fell back to parsing
+        `quser` text output, and why, if it fell back. Purely a
+        diagnostic -- used to enrich Invoke-DashboardRdpBootstrap's
+        timeout error with enough detail to actually tell what happened
+        instead of guessing.
+    #>
+    [pscustomobject]@{
+        Source = if ($script:LastSessionSource) { $script:LastSessionSource } else { 'unknown (Get-AllUserSessions not yet called)' }
+        FallbackReason = $script:LastSessionSourceError
+    }
 }
 
 function global:Get-UserSessions {
@@ -166,15 +213,23 @@ function global:Get-UserRdpSessionId {
 
 function global:Wait-DashboardRdpSession {
     <#
-        Polls (blocking) until the user's actual, live-detected RDP session
-        ID shows Active/Connected, or the timeout elapses. Meant to be
-        called from a background runspace -- see this module's header
+        Polls (blocking) until the user's actual, live-detected session ID
+        shows Online (Active/Connected), or the timeout elapses. Meant to
+        be called from a background runspace -- see this module's header
         comment -- so it deliberately does not pump any UI message loop.
+
+        Deliberately does NOT require IsRdp/a 'RDP-Tcp*' session-name match
+        here: a dashboard-managed local account has no legitimate session
+        type other than RDP in this architecture, so gating on the session
+        name adds a possible false-negative (e.g. if RDP Wrapper ever
+        reports a session name that doesn't match the expected pattern)
+        without adding any real safety -- Online plus the right username is
+        already a sufficient, unambiguous signal that the login succeeded.
     #>
     param([Parameter(Mandatory)][string]$Username,[int]$TimeoutSeconds=30,[int[]]$IgnoreSessionIds=@())
     $deadline=(Get-Date).AddSeconds($TimeoutSeconds)
     do {
-        $session=@(Get-UserSessions -Username $Username | Where-Object { $_.IsRdp -and $_.State -match '^(Active|Conn)$' -and ($IgnoreSessionIds -notcontains $_.SessionId) } | Sort-Object SessionId | Select-Object -First 1)
+        $session=@(Get-UserSessions -Username $Username | Where-Object { $_.Online -and ($IgnoreSessionIds -notcontains $_.SessionId) } | Sort-Object SessionId | Select-Object -First 1)
         if ($null -ne $session -and @($session).Count -gt 0) { return $session[0] }
         Start-Sleep -Milliseconds 500
     } while ((Get-Date) -lt $deadline)
