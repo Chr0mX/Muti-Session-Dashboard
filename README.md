@@ -62,6 +62,8 @@ powershell.exe -ExecutionPolicy Bypass -File "C:\Program Files\Muti Session Dash
 
 RDP Wrapper is installed with the upstream-supported console argument `-install`. The upstream source treats `-offline` as a flag that disables update checks, so the dashboard installer no longer uses it by default because it can prevent the installer from fetching current wrapper metadata. To pass explicit installer arguments, use `-RdpWrapperInstallArguments`; to change the wait, use `-RdpWrapperInstallTimeoutSeconds`.
 
+**Log off and back on (or reboot) once after installing.** `tscon` (the mechanism Start/Connect RDP use to hand a session to console) requires `SeTcbPrivilege` ("Act as part of the operating system"), which local Administrators don't hold by default. The installer grants it to the Administrators group via local security policy (`Grant-DashboardTcbPrivilege`), but that only applies to *new* logon tokens — if you're already logged in when you install, `tscon` will keep failing (typically with error 1326 or 7045) until you log off/on or reboot and relaunch the dashboard.
+
 Moonlight and Sunshine downloads are resolved from `https://api.github.com/repos/moonlight-stream/moonlight-qt/releases/latest` and `https://api.github.com/repos/LizardByte/Sunshine/releases/latest`, then matched against portable Windows ZIP asset name patterns before downloading.
 
 The installer caches dependency archives under `C:\Program Files\Muti Session Dashboard\Config\Downloads` and reuses them on later runs, so repeated installs do not re-download files unnecessarily. Use `-RefreshDownloadCache` to clear the cache before installing.
