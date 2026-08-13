@@ -538,17 +538,28 @@ function global:Start-DashboardBackgroundTask {
         non-blocking.
 
         Non-blocking end to end:
-          1. PowerShell.BeginInvoke() starts the command on a background
-             runspace and returns immediately.
-          2. ThreadPool.RegisterWaitForSingleObject waits for that
-             invocation's completion handle WITHOUT polling or blocking any
-             thread the caller cares about; its callback fires on a
-             ThreadPool thread once the background command finishes.
-          3. That ThreadPool-thread callback never touches WinForms
-             controls directly -- it marshals -OnSuccess/-OnError/
-             -OnComplete onto -Control's own thread via the standard,
-             thread-safe Control.BeginInvoke, which is the only supported
-             way to touch a WinForms control from a non-UI thread.
+          1. PowerShell.BeginInvoke() starts the command on its own
+             background runspace/thread and returns immediately -- this UI
+             thread never waits on it directly.
+          2. Completion is detected by polling IsCompleted from a WinForms
+             Timer, not a raw .NET ThreadPool callback. This matters: a
+             ThreadPool callback (e.g. via ThreadPool.RegisterWaitForSingleObject)
+             fires on a pooled worker thread that has no PowerShell runspace
+             attached, so it cannot run any PowerShell script at all --
+             attempting to would crash the whole process the instant it
+             fires ("There is no Runspace available to run scripts in this
+             thread"). A WinForms Timer's Tick, by contrast, always fires on
+             the thread that created it (here, always the UI thread, since
+             Start-DashboardBackgroundTask is only ever called from a button
+             handler or the monitor tick) via the same message loop
+             ShowDialog() already pumps -- exactly like the pre-existing
+             session timer, so it already has a valid runspace.
+          3. -OnSuccess/-OnError/-OnComplete are still funneled through
+             -Control's Control.BeginInvoke, the standard, safe way to touch
+             a WinForms control -- harmless even though the poll timer's
+             Tick is already running on that same UI thread, and it keeps
+             this helper correct if a future caller ever did trigger it from
+             a different thread.
     #>
     param(
         [Parameter(Mandatory)][string]$Command,
@@ -591,8 +602,13 @@ function global:Start-DashboardBackgroundTask {
 
     $asyncResult = $ps.BeginInvoke()
 
-    $onWaitComplete = {
-        param($state, $timedOut)
+    $pollTimer = New-Object System.Windows.Forms.Timer
+    $pollTimer.Interval = 150
+    $pollTimer.Add_Tick({
+        if (-not $asyncResult.IsCompleted) { return }
+        $pollTimer.Stop()
+        $pollTimer.Dispose()
+
         try {
             $output = $ps.EndInvoke($asyncResult)
             if ($ps.Streams.Error.Count -gt 0) { throw $ps.Streams.Error[0].Exception }
@@ -613,11 +629,8 @@ function global:Start-DashboardBackgroundTask {
             $ps.Dispose()
             $runspace.Dispose()
         }
-    }
-
-    $waitCallback = [System.Threading.WaitOrTimerCallback]$onWaitComplete
-    [void][System.Threading.ThreadPool]::RegisterWaitForSingleObject(
-        $asyncResult.AsyncWaitHandle, $waitCallback, $null, [System.Threading.Timeout]::Infinite, $true)
+    })
+    $pollTimer.Start()
 }
 
 # Load the four focused backend modules. One direction only (coordinator ->
