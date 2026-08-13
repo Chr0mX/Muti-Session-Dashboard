@@ -9,7 +9,6 @@ $script:DownloadCacheRoot = Join-Path $script:ConfigRoot 'Downloads'
 $script:PortStart = 47989
 $script:PortEnd = 48050
 $script:RdpHost = '127.0.0.2'
-$script:RdpPlusPath = 'C:\Program Files (x86)\Remote Desktop Plus\rdp.exe'
 $script:RdpPort = 3389
 
 
@@ -521,49 +520,6 @@ function Maintain-DashboardSession {
     return (Get-UserSession -Username $Username)
 }
 
-function Keep-DashboardRdpSessionAlive {
-    param([Parameter(Mandatory)][string]$Username)
-    $session=Get-UserRdpSessionId -Username $Username | Select-Object -First 1
-    if ($null -eq $session) { throw "No RDP session was found for '$Username'." }
-    Invoke-TsconToConsole -SessionId $session.SessionId
-    Start-Sleep -Milliseconds 500
-    $console=Get-UserConsoleSession -Username $Username | Select-Object -First 1
-    if ($null -eq $console -or -not $console.Online) { throw "tscon completed for '$Username', but the console session is not Active." }
-    return $console.SessionId
-}
-
-function Invoke-DashboardRdpPlusBootstrap {
-    param([Parameter(Mandatory)][string]$Username)
-
-    Assert-Administrator
-
-    $rdpPlus = $script:RdpPlusPath
-    if (-not (Test-Path -LiteralPath $rdpPlus)) {
-        throw "Remote Desktop Plus was not found at '$rdpPlus'. Install Remote Desktop Plus before using Start."
-    }
-
-    # Dashboard-created accounts use the username as the initial password.
-    # Do not use cmdkey here: RDP Plus receives the credentials explicitly.
-    # /w and /h force the bootstrap RDP connection to 1920x1080.
-    $arguments = @(
-        '/v:127.0.0.2:3389',
-        "/u:.\$Username",
-        "/p:$Username",
-        '/w:1920',
-        '/h:1080'
-    )
-
-    Write-Host "Starting Remote Desktop Plus for '$Username' at 1920x1080."
-    Start-Process -FilePath $rdpPlus -ArgumentList $arguments | Out-Null
-
-    $session = Wait-DashboardRdpSession -Username $Username -TimeoutSeconds 30
-    if ($null -eq $session) {
-        throw "Remote Desktop Plus did not create an active RDP session for '$Username' within 30 seconds."
-    }
-
-    return $session
-}
-
 function Invoke-DashboardRdpBootstrap {
     param([Parameter(Mandatory)][string]$Username)
 
@@ -761,8 +717,9 @@ function Start-DashboardSession {
     Assert-Administrator
     if (-not (Test-TsconAvailable)) { throw 'Windows tscon.exe is required but was not found.' }
 
-    # 1) Create a real 1920x1080 RDP login for the selected user using Remote Desktop Plus.
-    $rdpSession = Invoke-DashboardRdpPlusBootstrap -Username $Username
+    # 1) Create a real 1920x1080 RDP login for the selected user using native mstsc,
+    #    against the per-user RDP alias with the saved Windows credential.
+    $rdpSession = Invoke-DashboardRdpBootstrap -Username $Username
 
     # 2) Hand the RDP session to the local console so the Windows session survives.
     Invoke-TsconToConsole -SessionId $rdpSession.SessionId
@@ -793,21 +750,19 @@ function Start-DashboardSession {
 function Connect-DashboardRdp {
     param([Parameter(Mandatory)][string]$Username)
     Assert-Administrator
-    if (-not (Test-Path -LiteralPath $script:RdpPlusPath)) { throw "Remote Desktop Plus was not found at '$script:RdpPlusPath'." }
 
-    $before=@(Get-UserSessions -Username $Username)
-    $beforeIds=@($before | ForEach-Object { $_.SessionId })
-    $arguments=@('/v:127.0.0.2:3389',"/u:.\$Username","/p:$Username",'/w:1920','/h:1080')
-    Start-Process -FilePath $script:RdpPlusPath -ArgumentList $arguments | Out-Null
-
-    $rdp=Wait-DashboardRdpSession -Username $Username -TimeoutSeconds 30 -IgnoreSessionIds $beforeIds
-    if ($null -eq $rdp) { $rdp=Wait-DashboardRdpSession -Username $Username -TimeoutSeconds 5 }
-    if ($null -eq $rdp) { throw "Remote Desktop Plus did not produce an Active RDP session for '$Username'." }
+    # Reconnects to the user's Windows session using native mstsc against the
+    # per-user RDP alias and saved credential. If Start previously handed the
+    # session off to the console with tscon, this creates a fresh RDP session
+    # for the same Windows logon rather than a brand new user session; the
+    # session monitor hands it back to console via tscon when it disconnects.
+    $rdp = Invoke-DashboardRdpBootstrap -Username $Username
 
     $state=Get-DashboardState
     if ($state.ContainsKey($Username)) {
         $state[$Username].RdpSessionId=$rdp.SessionId
         $state[$Username].RdpConnectionStatus='Connected'
+        $state[$Username].SessionState='Running'
         Save-DashboardState -State $state
     }
     return $rdp
@@ -854,10 +809,9 @@ function Test-DashboardInstallation {
         'Moonlight downloaded' = (Test-Path -LiteralPath (Join-Path $script:InstallRoot 'Stream\Moonlight\Moonlight.exe'))
         'Sunshine downloaded' = (Test-Path -LiteralPath (Join-Path $script:InstallRoot 'Stream\Sunshine\Sunshine.exe'))
         'tscon available' = (Test-TsconAvailable)
-        'Remote Desktop Plus available' = (Test-Path -LiteralPath $script:RdpPlusPath)
         'Dashboard installed' = (Test-Path -LiteralPath (Join-Path $script:InstallRoot 'Dashboard.ps1'))
     }
     $checks.GetEnumerator() | ForEach-Object { [pscustomobject]@{ Check=$_.Key; Passed=[bool]$_.Value } }
 }
 
-Export-ModuleMember -Function *-Dashboard*,Install-*,Test-*,New-DashboardUser,Start-DashboardSession,Stop-DashboardSession,Connect-DashboardRdp,Keep-Alive-DashboardRdp,Connect-DashboardMoonlight,Assert-Administrator,Set-DashboardPaths,Invoke-RdpWrapperInstaller,Get-RdpEndpoint,Get-DashboardState,Get-RemoteDesktopUsers,Get-UserSession,Get-UserSessions,Get-UserRdpSessionId,Get-UserConsoleSession,Maintain-DashboardSession,Invoke-DashboardRdpPlusBootstrap,Set-DashboardRdpCredential,Test-DashboardRdpCredential
+Export-ModuleMember -Function *-Dashboard*,Install-*,Test-*,New-DashboardUser,Start-DashboardSession,Stop-DashboardSession,Connect-DashboardRdp,Keep-Alive-DashboardRdp,Connect-DashboardMoonlight,Assert-Administrator,Set-DashboardPaths,Invoke-RdpWrapperInstaller,Get-RdpEndpoint,Get-DashboardState,Get-RemoteDesktopUsers,Get-UserSession,Get-UserSessions,Get-UserRdpSessionId,Get-UserConsoleSession,Maintain-DashboardSession,Invoke-DashboardRdpBootstrap,Set-DashboardRdpCredential,Test-DashboardRdpCredential

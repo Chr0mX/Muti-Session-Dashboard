@@ -12,7 +12,6 @@ C:\Program Files\Muti Session Dashboard\
 ├── Stream\
 │   ├── Moonlight\
 │   └── Sunshine\
-├── Aardwolf\
 ├── Config\
 └── Users\
 ```
@@ -21,13 +20,33 @@ RDP Wrapper is installed separately at `C:\Program Files\RDP Wrapper` using `htt
 
 ## Scripts
 
-- `scripts/Install-MultiSessionDashboard.ps1` downloads, installs, configures, and verifies RDP Wrapper from the release executable, resolves the latest Moonlight Portable and Sunshine Portable archives through the GitHub releases API, installs Aardwolf CLI/GUI, and installs the dashboard.
-- `scripts/Dashboard.ps1` provides the operator dashboard with Create User, Start, Connect RDP, Connect Moonlight, Stop, and Refresh actions.
-- `scripts/MultiSessionDashboard.psm1` contains the reusable implementation for dependency verification, user creation, per-user Sunshine isolation, port allocation, Aardwolf integration, and Moonlight launching.
+- `install.ps1` is the URL-based entry point (`irm ... | iex`). It stages the scripts below from raw GitHub and runs the installer with a forced dependency refresh, so it doubles as the update command.
+- `scripts/Install-MultiSessionDashboard.ps1` downloads, installs, configures, and verifies RDP Wrapper from the release executable, resolves the latest Moonlight Portable and Sunshine Portable archives through the GitHub releases API, and installs the dashboard.
+- `scripts/Dashboard.ps1` provides the operator dashboard with Create User, Start, Connect RDP, Connect Moonlight, Stop, and Refresh actions. Start opens a native RDP login for the selected user and hands it off to the console with `tscon` so the session survives the client disconnecting; Connect RDP reconnects to that same Windows session. A background monitor polls every Remote Desktop Users member's real session state every 2 seconds, so the dashboard reflects RDP connections made outside the dashboard too (e.g. a manual mstsc connection), and keeps handing disconnected RDP sessions back to the console via `tscon`.
+- `scripts/MultiSessionDashboard.psm1` contains the reusable implementation for dependency verification, user creation, per-user Sunshine isolation, port allocation, RDP session handoff, and Moonlight launching.
 
 ## Quick start
 
-Run from an elevated PowerShell prompt on Windows:
+### Install / update from a URL
+
+The recommended way to install or update is a single command from an elevated
+PowerShell prompt — no local checkout required:
+
+```powershell
+irm https://raw.githubusercontent.com/Chr0mX/Muti-Session-Dashboard/main/install.ps1 | iex
+```
+
+The same command is used to update: it always fetches the latest scripts and
+dependency releases (RDP Wrapper, Moonlight, Sunshine) and re-runs the
+installer over the existing installation.
+
+Then launch the dashboard:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File "C:\Program Files\Muti Session Dashboard\Dashboard.ps1"
+```
+
+### Install from a local checkout
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass -Force
