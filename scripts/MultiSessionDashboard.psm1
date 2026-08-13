@@ -738,13 +738,40 @@ function Invoke-DashboardRdpBootstrap {
     )
 
     Write-Host "Starting Remote Desktop Plus for '$Username' at 1920x1080."
-    Start-Process -FilePath $rdpPlusPath -ArgumentList $arguments | Out-Null
+    $rdpPlusProcess = Start-Process -FilePath $rdpPlusPath -ArgumentList $arguments -PassThru
 
     $session = Wait-DashboardRdpSession -Username $Username -TimeoutSeconds 30
     if ($null -eq $session) {
         throw "RDP login for '$Username' did not produce an active RDP session within 30 seconds."
     }
+
+    # Stashed so Start-DashboardSession can close the client window once it
+    # has handed the session to console (that window is no longer needed --
+    # the session lives on via tscon). Connect-DashboardRdp deliberately
+    # ignores this: that window IS the live interactive session.
+    $session | Add-Member -NotePropertyName RdpPlusProcessId -NotePropertyValue $rdpPlusProcess.Id -Force
     return $session
+}
+
+function Stop-DashboardRdpPlusProcess {
+    <#
+        Closes the Remote Desktop Plus client window Start-DashboardSession
+        launched, once tscon has already handed its session off to console
+        and the window is just stale leftover. Remote Desktop Plus wraps
+        mstsc.exe, so the visible window may belong to either the rdp.exe
+        process itself or a child mstsc.exe it spawned -- close both.
+        Best-effort/cosmetic: failures here should never fail Start.
+    #>
+    param([Parameter(Mandatory)][int]$ProcessId)
+    try {
+        $children = @(Get-CimInstance -ClassName Win32_Process -Filter "ParentProcessId=$ProcessId" -ErrorAction SilentlyContinue)
+        foreach ($child in $children) {
+            Stop-Process -Id $child.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+        Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+    } catch {
+        Write-Verbose "Could not close the Remote Desktop Plus window (PID $ProcessId): $($_.Exception.Message)"
+    }
 }
 
 function Keep-DashboardRdpSessionAlive {
@@ -1224,6 +1251,13 @@ function Start-DashboardSession {
 
     # 2) Hand the RDP session to the local console so the Windows session survives.
     Invoke-TsconToConsole -SessionId $rdpSession.SessionId
+
+    # The Remote Desktop Plus window is now stale -- its session already
+    # lives on via tscon -- so close it instead of leaving a disconnected
+    # client window behind. Cosmetic cleanup only; never fails Start.
+    if ($rdpSession.PSObject.Properties['RdpPlusProcessId']) {
+        Stop-DashboardRdpPlusProcess -ProcessId $rdpSession.RdpPlusProcessId
+    }
 
     # 3) Confirm the Windows session is still online after the handoff.
     Start-Sleep -Milliseconds 750
