@@ -52,6 +52,7 @@ foreach ($column in @(
     @{ Name='SessionState'; Header='Session'; Width=100 },
     @{ Name='SunshineState'; Header='Sunshine'; Width=100 },
     @{ Name='SunshinePort'; Header='Sunshine Port'; Width=100 },
+    @{ Name='SunshineLoopback'; Header='Moonlight Host'; Width=110 },
     @{ Name='RdpConnectionStatus'; Header='RDP Status'; Width=130 }
 )) {
     $columnObject = New-Object Windows.Forms.DataGridViewTextBoxColumn
@@ -106,8 +107,8 @@ function Refresh-Grid {
             if (-not $state.ContainsKey($key)) {
                 $state[$key] = @{
                     Username=$key; AccountName=$user.AccountName; SunshinePort=$null;
-                    SessionState='Stopped'; SunshineState='Stopped';
-                    RdpSessionId=$null; RdpConnectionStatus='Disconnected'
+                    SunshineLoopback=$null; SessionState='Stopped'; SunshineState='Stopped';
+                    RdpSessionId=$null; RdpConnectionStatus='Disconnected'; SunshineProcessId=$null
                 }
             }
 
@@ -119,6 +120,7 @@ function Refresh-Grid {
             $grid.Rows[$row].Cells['SessionState'].Value = $entry.SessionState
             $grid.Rows[$row].Cells['SunshineState'].Value = $entry.SunshineState
             $grid.Rows[$row].Cells['SunshinePort'].Value = $entry.SunshinePort
+            $grid.Rows[$row].Cells['SunshineLoopback'].Value = $entry.SunshineLoopback
             $grid.Rows[$row].Cells['RdpConnectionStatus'].Value = $entry.RdpConnectionStatus
         }
 
@@ -145,11 +147,12 @@ function Update-SessionMonitor {
             if (-not $state.ContainsKey($key)) {
                 $state[$key] = @{
                     Username=$key; AccountName=$user.AccountName; SunshinePort=$null;
-                    SessionState='Stopped'; SunshineState='Stopped';
-                    RdpSessionId=$null; RdpConnectionStatus='Disconnected'
+                    SunshineLoopback=$null; SessionState='Stopped'; SunshineState='Stopped';
+                    RdpSessionId=$null; RdpConnectionStatus='Disconnected'; SunshineProcessId=$null
                 }
             }
             $entry = $state[$key]
+            $hasWindowsSession = $false
 
             try {
                 $session = Maintain-DashboardSession -Username $key
@@ -157,26 +160,48 @@ function Update-SessionMonitor {
                     $entry.RdpSessionId = $null
                     $entry.RdpConnectionStatus = 'Disconnected'
                     if ($entry.SessionState -eq 'Running') { $entry.SessionState = 'Stopped' }
-                    continue
-                }
-
-                $entry.RdpSessionId = $session.SessionId
-                if ($session.IsRdp -and $session.Online) {
-                    # A live RDP reconnect is intentionally left alone so the
-                    # operator can use the GUI. tscon is only applied after the
-                    # RDP client disconnects.
-                    $entry.RdpConnectionStatus = 'Connected'
-                    $entry.SessionState = 'Running'
-                } elseif ($session.IsConsole -and $session.Online) {
-                    $entry.RdpConnectionStatus = 'Online'
-                    $entry.SessionState = 'Running'
                 } else {
-                    $entry.RdpConnectionStatus = 'Disconnected'
+                    $hasWindowsSession = $true
+                    $entry.RdpSessionId = $session.SessionId
+                    if ($session.IsRdp -and $session.Online) {
+                        # A live RDP reconnect is intentionally left alone so the
+                        # operator can use the GUI. tscon is only applied after the
+                        # RDP client disconnects.
+                        $entry.RdpConnectionStatus = 'Connected'
+                        $entry.SessionState = 'Running'
+                    } elseif ($session.IsConsole -and $session.Online) {
+                        $entry.RdpConnectionStatus = 'Online'
+                        $entry.SessionState = 'Running'
+                    } else {
+                        $entry.RdpConnectionStatus = 'Disconnected'
+                    }
                 }
             } catch {
                 # Keep the dashboard alive even if a single user's session
                 # temporarily cannot be queried or handed off.
                 $entry.RdpConnectionStatus = 'Error'
+            }
+
+            # Never trust the flag Start/Stop last set: re-derive SunshineState
+            # from the actual process/owner/port every tick, same as the RDP
+            # status above. Skip the check entirely when there's no Windows
+            # session at all -- nothing meaningful can be running.
+            if ($hasWindowsSession) {
+                try {
+                    $sunshineStatus = Test-UserSunshineRunning -Username $key
+                    if ($sunshineStatus.Running) {
+                        $entry.SunshineState = 'Running'
+                        $entry.SunshineProcessId = $sunshineStatus.ProcessId
+                    } else {
+                        $entry.SunshineState = 'Stopped'
+                        $entry.SunshineProcessId = $null
+                    }
+                } catch {
+                    $entry.SunshineState = 'Error'
+                }
+            } elseif ($entry.SunshineState -ne 'Stopped') {
+                $entry.SunshineState = 'Stopped'
+                $entry.SunshineProcessId = $null
             }
         }
         Save-DashboardState -State $state
@@ -189,6 +214,7 @@ function Update-SessionMonitor {
             $row.Cells['SessionState'].Value = $entry.SessionState
             $row.Cells['SunshineState'].Value = $entry.SunshineState
             $row.Cells['SunshinePort'].Value = $entry.SunshinePort
+            $row.Cells['SunshineLoopback'].Value = $entry.SunshineLoopback
             $row.Cells['RdpConnectionStatus'].Value = $entry.RdpConnectionStatus
         }
     } catch {
