@@ -215,12 +215,22 @@ function global:Invoke-DashboardRdpBootstrap {
     # from showing its own error messages/prompts, which is what was
     # popping up instead of an instant, silent connect -- confirmed against
     # RDP+'s actual documented command-line syntax (donkz.nl), not assumed.
+    # /log likewise comes from that same documented syntax: it makes RDP+
+    # write its own connection diagnostics to a file, which is surfaced
+    # below on a timeout instead of guessing again at why the session never
+    # came up Active -- a real symptom seen once already is the session
+    # landing in Disconnected with no session name at all, meaning rdp.exe
+    # itself never completed the connection; RDP+'s own log is the only
+    # place that can say why.
     $rdpFile = New-DashboardRdpFile -Username $Username
+    $logFile = Join-Path (Get-DashboardConfigRoot) "Logs\$Username-rdp-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+    New-DirectoryIfMissing -Path (Split-Path -Parent $logFile)
     $arguments = @(
         "`"$rdpFile`"",
         "/u:.\$Username",
         "/p:$Username",
-        '/batch'
+        '/batch',
+        "/log:`"$logFile`""
     )
 
     Write-Host "Starting Remote Desktop Plus for '$Username' at 1920x1080."
@@ -249,7 +259,23 @@ function global:Invoke-DashboardRdpBootstrap {
             }) -join '; '
         }
         $fallbackNote = if ($sourceInfo.FallbackReason) { " (fell back because: $($sourceInfo.FallbackReason))" } else { '' }
-        throw "RDP login for '$Username' did not produce an active RDP session within 45 seconds. Detection source: $($sourceInfo.Source)$fallbackNote. Sessions observed for '$Username': $dump. Run 'query session' to compare against what Windows itself reports."
+
+        $processNote = try {
+            $proc = Get-Process -Id $process.Id -ErrorAction Stop
+            "rdp.exe (PID $($process.Id)) is still running."
+        } catch {
+            "rdp.exe (PID $($process.Id)) has already exited (exit code $($process.ExitCode))."
+        }
+
+        $logNote = if (Test-Path -LiteralPath $logFile) {
+            $logContent = (Get-Content -LiteralPath $logFile -Raw -ErrorAction SilentlyContinue)
+            if ([string]::IsNullOrWhiteSpace($logContent)) { "RDP+ log at '$logFile' exists but is empty." }
+            else { "RDP+ log ('$logFile'):`n$logContent" }
+        } else {
+            "RDP+ did not create a log file at '$logFile'."
+        }
+
+        throw "RDP login for '$Username' did not produce an active RDP session within 45 seconds. $processNote Detection source: $($sourceInfo.Source)$fallbackNote. Sessions observed for '$Username': $dump. $logNote Run 'query session' to compare against what Windows itself reports."
     }
 
     if ($Minimize) { Set-DashboardWindowMinimized -ProcessId $process.Id }
