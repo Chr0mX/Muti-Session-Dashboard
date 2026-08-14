@@ -138,33 +138,48 @@ function global:New-DashboardRdpFile {
 
 function global:Set-DashboardWindowProperties {
     <#
-        Best-effort title-set and/or minimize of an rdp.exe process's main
-        window. Used for two things:
+        Best-effort title-set and/or hide of every top-level window owned by
+        an rdp.exe process. Used for two things:
           - Giving every RDP+ window a distinguishable title
             ("RDP-<user>-Headless" for an armed headless loopback,
-            "RDP-<user>" for a real interactive session), via SetWindowText.
-          - Keeping an "armed" headless loopback connection out of the
-            operator's way, via ShowWindow(SW_MINIMIZE), when -Minimize is
-            passed. This is the ONLY minimize mechanism -Minimize uses --
-            see Invoke-DashboardRdpBootstrap's comment for why Start-Process
+            "RDP-<user>" for a real interactive session), via SetWindowText
+            -- a harmless backup here; the primary title mechanism is
+            RDP+'s own /title: command-line flag, set in
+            Invoke-DashboardRdpBootstrap.
+          - Keeping an "armed" headless loopback connection fully out of
+            the operator's way, via ShowWindow(SW_HIDE) (no taskbar entry
+            at all, not just minimized), when -Minimize is passed. This is
+            the ONLY hide mechanism -Minimize uses -- see
+            Invoke-DashboardRdpBootstrap's comment for why Start-Process
             -WindowStyle Minimized was tried and reverted (it crashes RDP+
             outright, a real bug in RDP+'s own startup code).
 
-        A single one-shot "find the handle once, apply, and stop" was not
-        enough in practice for minimizing: a window that appears late (or
-        gets replaced/re-shown partway through RDP negotiation) can end up
-        visible anyway. The same reasoning applies to the title, so this
-        keeps re-applying whatever was requested for the whole timeout
-        window -- cheap and idempotent -- rather than a single pass.
-        Failure here is still non-fatal -- the RDP session itself is what
-        matters; a window whose title/minimize state couldn't be set is
-        just a cosmetic miss.
+        Deliberately does NOT use Process.MainWindowHandle: that's a .NET
+        heuristic that picks (at most) one window per process by its own
+        rules, isn't guaranteed to track the actual final/visible window if
+        the process shows more than one top-level window over its lifetime
+        (e.g. an initial dialog later replaced by the real session view),
+        and was the previous approach here -- confirmed not reliably
+        working for hiding the window even after several rounds of
+        persistence/timeout tuning. This instead walks every top-level
+        window on the system via EnumWindows, matches by owning process ID
+        via GetWindowThreadProcessId (not any single-window heuristic), and
+        applies to every match, not just one.
+
+        A single one-shot "find the handle(s) once, apply, and stop" was
+        not enough in practice either: a window that appears late (or gets
+        replaced/re-shown partway through RDP negotiation) can end up
+        visible anyway. This keeps re-enumerating and re-applying for the
+        whole timeout window -- cheap and idempotent -- rather than a
+        single pass. Failure here is still non-fatal -- the RDP session
+        itself is what matters; a window whose title/visibility couldn't be
+        set is just a cosmetic miss.
     #>
     param(
         [Parameter(Mandatory)][int]$ProcessId,
         [string]$Title,
         [switch]$Minimize,
-        [int]$TimeoutSeconds = 15
+        [int]$TimeoutSeconds = 20
     )
 
     if (-not ('BetterRdp.Window' -as [type])) {
@@ -172,8 +187,19 @@ function global:Set-DashboardWindowProperties {
         # `using System.Runtime.InteropServices;` by default, and passing
         # it again fails to compile (CS0105) -- see the matching comment
         # in SessionManager.psm1's Add-DashboardWtsApiType, where this was
-        # actually caught.
+        # actually caught. EnumWindowsProc is a nested delegate type here
+        # (valid C# inside a class body), the same pattern already used for
+        # BetterRdp.Wts+WTS_SESSION_INFO's nested struct in
+        # SessionManager.psm1.
         Add-Type -Namespace BetterRdp -Name Window -MemberDefinition @'
+public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+[DllImport("user32.dll")]
+public static extern bool EnumWindows(EnumWindowsProc enumProc, IntPtr lParam);
+
+[DllImport("user32.dll")]
+public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
 [DllImport("user32.dll")]
 public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
@@ -181,24 +207,35 @@ public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 public static extern bool SetWindowText(IntPtr hWnd, string lpString);
 '@
     }
-    $SW_MINIMIZE = 6
+    $SW_HIDE = 0
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     do {
         try {
-            $proc = Get-Process -Id $ProcessId -ErrorAction Stop
-            $proc.Refresh()
-            if ($proc.MainWindowHandle -ne [IntPtr]::Zero) {
-                if (-not [string]::IsNullOrEmpty($Title)) {
-                    [BetterRdp.Window]::SetWindowText($proc.MainWindowHandle, $Title) | Out-Null
-                }
-                if ($Minimize) {
-                    [BetterRdp.Window]::ShowWindow($proc.MainWindowHandle, $SW_MINIMIZE) | Out-Null
-                }
-            }
+            $null = Get-Process -Id $ProcessId -ErrorAction Stop
         } catch {
             return
         }
+
+        $handles = [System.Collections.Generic.List[IntPtr]]::new()
+        $callback = [BetterRdp.Window+EnumWindowsProc]{
+            param([IntPtr]$hWnd, [IntPtr]$lParam)
+            $ownerPid = [uint32]0
+            [void][BetterRdp.Window]::GetWindowThreadProcessId($hWnd, [ref]$ownerPid)
+            if ($ownerPid -eq [uint32]$ProcessId) { [void]$handles.Add($hWnd) }
+            return $true
+        }.GetNewClosure()
+        [void][BetterRdp.Window]::EnumWindows($callback, [IntPtr]::Zero)
+
+        foreach ($handle in $handles) {
+            if (-not [string]::IsNullOrEmpty($Title)) {
+                [BetterRdp.Window]::SetWindowText($handle, $Title) | Out-Null
+            }
+            if ($Minimize) {
+                [BetterRdp.Window]::ShowWindow($handle, $SW_HIDE) | Out-Null
+            }
+        }
+
         Start-Sleep -Milliseconds 500
     } while ((Get-Date) -lt $deadline)
 }
