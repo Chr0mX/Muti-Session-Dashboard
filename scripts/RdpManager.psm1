@@ -231,9 +231,20 @@ function global:Invoke-DashboardRdpBootstrap {
     # to "never completes the connection at all" (the session landing in
     # Disconnected with no session name -- rdp.exe never got that far).
     # Removed both; back to the minimal, verifiable command line.
+    # /v: is added explicitly here, not just relied on via the .rdp file's
+    # own "full address:" line, because of what was actually observed:
+    # without it, RDP+ shows its main connect dialog pre-filled with the
+    # right target/user/password but waiting for someone to click
+    # "Connect" -- it never auto-connects. That matches the documented
+    # syntax's own pattern (`rdp ["connection file"] [/v:computer...]
+    # [/u:...] [/p:...] ...`), where /v: on the command line is what
+    # actually triggers a direct/automatic connect; a target that only
+    # exists inside the referenced file appears to just pre-fill the GUI
+    # for manual confirmation instead.
     $rdpFile = New-DashboardRdpFile -Username $Username
     $arguments = @(
         "`"$rdpFile`"",
+        "/v:$($script:RdpHost):$($script:RdpPort)",
         "/u:.\$Username",
         "/p:$Username"
     )
