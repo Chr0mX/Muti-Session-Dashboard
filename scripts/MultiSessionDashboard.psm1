@@ -444,10 +444,15 @@ function global:Update-DashboardMonitorState {
     <#
         One full monitoring pass: refresh Remote Desktop Users membership,
         poll each member's real Windows session state (via the live WTS
-        session ID, never a hard-coded one), and -- if an interactively
-        connected user's session has gone offline without an explicit Stop
-        -- wait for it to actually finish closing and then re-arm their
-        headless loopback right here.
+        session ID, never a hard-coded one), and -- for any RDS user who is
+        currently Disconnected, not already headless-armed, and hasn't been
+        explicitly Stopped -- wait for their session to genuinely finish
+        closing (a no-op wait if there's no session at all yet, e.g. a
+        brand-new user) and re-arm their headless loopback right here. This
+        keeps every RDS user "HEADLESS ready" by default at all times, not
+        just users who were previously interactively connected -- Start is
+        a manual "do it now" shortcut, not the only way a user ever gets
+        armed.
 
         This entire function is meant to run inside the background
         runspace Start-DashboardBackgroundTask creates for it (see
@@ -465,7 +470,6 @@ function global:Update-DashboardMonitorState {
             $state[$key] = Get-DefaultDashboardStateEntry -Username $key -AccountName $user.AccountName
         }
         $entry = $state[$key]
-        $wasInteractive = ($entry.SessionState -eq 'Running')
 
         try {
             $session = Get-UserSession -Username $key
@@ -494,13 +498,16 @@ function global:Update-DashboardMonitorState {
             $entry.RdpConnectionStatus = 'Error'
         }
 
-        # CONNECT workflow, continued: once the interactive client that
-        # displaced a headless connection disconnects (session goes fully
-        # offline), wait until it has genuinely finished closing and then
-        # automatically start a fresh headless loopback so the user is
-        # HEADLESS again -- unless the operator explicitly hit Stop.
-        $justWentOffline = ($wasInteractive -and $entry.SessionState -eq 'Stopped' -and -not $entry.HeadlessArmed -and -not $entry.StopRequested)
-        if ($justWentOffline) {
+        # Always-armed headless loopback: any RDS user sitting Disconnected
+        # (whether they just went offline, were never started at all, or a
+        # previous arm attempt failed) gets re-armed automatically, unless
+        # the operator explicitly hit Stop. Self-limiting: Start-DashboardHeadlessLoopback
+        # can block up to ~45s per attempt, and this whole function only
+        # ever has one instance in flight at a time ($script:MonitorTaskInFlight
+        # in Dashboard.ps1), so a persistently-failing arm retries roughly
+        # every ~45s+, not every 2s tick.
+        $needsArming = ($entry.RdpConnectionStatus -eq 'Disconnected' -and -not $entry.HeadlessArmed -and -not $entry.StopRequested)
+        if ($needsArming) {
             try {
                 Wait-DashboardSessionClosed -Username $key -TimeoutSeconds 10 | Out-Null
                 Start-DashboardHeadlessLoopback -Username $key | Out-Null

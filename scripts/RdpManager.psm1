@@ -4,8 +4,10 @@
     Owns everything about actually starting an automated RDP client
     connection: locating/installing Remote Desktop Plus, generating the
     per-user .rdp settings file (smart sizing and friends), launching it,
-    and minimizing it for a headless loopback connection. Also owns the
-    "Open RDP Wrapper" manager-launch helper, since that's RDP tooling too.
+    titling its window ("RDP-<user>-Headless" for an armed headless
+    loopback, "RDP-<user>" for a real interactive session), and minimizing
+    it for a headless loopback connection. Also owns the "Open RDP
+    Wrapper" manager-launch helper, since that's RDP tooling too.
 
     See SessionManager.psm1's header comment for why every function here is
     `function global:Verb-Noun`. This module is meant to be loaded through
@@ -134,24 +136,36 @@ function global:New-DashboardRdpFile {
     return $path
 }
 
-function global:Set-DashboardWindowMinimized {
+function global:Set-DashboardWindowProperties {
     <#
-        Best-effort minimize of an rdp.exe process's main window, used to
-        keep an "armed" headless loopback connection out of the operator's
-        way. This is the ONLY minimize mechanism -Minimize uses -- see
-        Invoke-DashboardRdpBootstrap's comment for why Start-Process
-        -WindowStyle Minimized was tried and reverted (it crashes RDP+
-        outright, a real bug in RDP+'s own startup code). A single
-        one-shot "find the handle once, then minimize and stop" was not
-        enough in practice either: a window that appears late (or gets
-        replaced/re-shown partway through RDP negotiation) can end up
-        visible anyway. This instead keeps re-applying ShowWindow for the
-        whole timeout window -- cheap and idempotent -- so a late or
-        re-shown window still gets caught. Failure here is still
-        non-fatal -- the RDP session itself is what matters; a window that
-        couldn't be minimized is just a cosmetic miss.
+        Best-effort title-set and/or minimize of an rdp.exe process's main
+        window. Used for two things:
+          - Giving every RDP+ window a distinguishable title
+            ("RDP-<user>-Headless" for an armed headless loopback,
+            "RDP-<user>" for a real interactive session), via SetWindowText.
+          - Keeping an "armed" headless loopback connection out of the
+            operator's way, via ShowWindow(SW_MINIMIZE), when -Minimize is
+            passed. This is the ONLY minimize mechanism -Minimize uses --
+            see Invoke-DashboardRdpBootstrap's comment for why Start-Process
+            -WindowStyle Minimized was tried and reverted (it crashes RDP+
+            outright, a real bug in RDP+'s own startup code).
+
+        A single one-shot "find the handle once, apply, and stop" was not
+        enough in practice for minimizing: a window that appears late (or
+        gets replaced/re-shown partway through RDP negotiation) can end up
+        visible anyway. The same reasoning applies to the title, so this
+        keeps re-applying whatever was requested for the whole timeout
+        window -- cheap and idempotent -- rather than a single pass.
+        Failure here is still non-fatal -- the RDP session itself is what
+        matters; a window whose title/minimize state couldn't be set is
+        just a cosmetic miss.
     #>
-    param([Parameter(Mandatory)][int]$ProcessId, [int]$TimeoutSeconds = 15)
+    param(
+        [Parameter(Mandatory)][int]$ProcessId,
+        [string]$Title,
+        [switch]$Minimize,
+        [int]$TimeoutSeconds = 15
+    )
 
     if (-not ('BetterRdp.Window' -as [type])) {
         # No -UsingNamespace: Add-Type -MemberDefinition already includes
@@ -162,6 +176,9 @@ function global:Set-DashboardWindowMinimized {
         Add-Type -Namespace BetterRdp -Name Window -MemberDefinition @'
 [DllImport("user32.dll")]
 public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+[DllImport("user32.dll", CharSet = CharSet.Auto)]
+public static extern bool SetWindowText(IntPtr hWnd, string lpString);
 '@
     }
     $SW_MINIMIZE = 6
@@ -172,7 +189,12 @@ public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
             $proc = Get-Process -Id $ProcessId -ErrorAction Stop
             $proc.Refresh()
             if ($proc.MainWindowHandle -ne [IntPtr]::Zero) {
-                [BetterRdp.Window]::ShowWindow($proc.MainWindowHandle, $SW_MINIMIZE) | Out-Null
+                if (-not [string]::IsNullOrEmpty($Title)) {
+                    [BetterRdp.Window]::SetWindowText($proc.MainWindowHandle, $Title) | Out-Null
+                }
+                if ($Minimize) {
+                    [BetterRdp.Window]::ShowWindow($proc.MainWindowHandle, $SW_MINIMIZE) | Out-Null
+                }
             }
         } catch {
             return
@@ -260,12 +282,12 @@ function global:Invoke-DashboardRdpBootstrap {
     # zero-sized, which is exactly what a window created already-minimized
     # has. Creating the window NORMAL-sized first and minimizing it
     # afterward (once it already has real dimensions) avoids ever
-    # triggering that path. Set-DashboardWindowMinimized below is that
-    # after-the-fact minimize, kept persistent (re-applies for its whole
-    # timeout window) specifically so it still catches a window that
-    # appears late or gets replaced during connection negotiation, without
-    # needing the startup-minimized approach that crashes this particular
-    # app.
+    # triggering that path. Set-DashboardWindowProperties below is that
+    # after-the-fact minimize (and title-set), kept persistent (re-applies
+    # for its whole timeout window) specifically so it still catches a
+    # window that appears late or gets replaced during connection
+    # negotiation, without needing the startup-minimized approach that
+    # crashes this particular app.
     $process = Start-Process -FilePath $rdpPlusPath -ArgumentList $arguments -PassThru
 
     # 45s, not 30s: a first-ever logon (profile creation, GPU/driver init)
@@ -306,7 +328,11 @@ function global:Invoke-DashboardRdpBootstrap {
         throw "RDP login for '$Username' did not produce an active RDP session within 45 seconds. $processNote Detection source: $($sourceInfo.Source)$fallbackNote. Sessions observed for '$Username': $dump. Run 'query session' to compare against what Windows itself reports."
     }
 
-    if ($Minimize) { Set-DashboardWindowMinimized -ProcessId $process.Id }
+    # Title always gets set, whether this is a headless anchor or a real
+    # interactive session, so the two are distinguishable (e.g. in Task
+    # Manager or Alt-Tab) -- only minimizing is conditional on -Minimize.
+    $windowTitle = if ($Minimize) { "RDP-$Username-Headless" } else { "RDP-$Username" }
+    Set-DashboardWindowProperties -ProcessId $process.Id -Title $windowTitle -Minimize:$Minimize
 
     return [pscustomobject]@{
         Username  = $session.Username
