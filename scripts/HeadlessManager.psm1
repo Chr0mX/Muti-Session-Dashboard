@@ -74,6 +74,7 @@ function global:Start-DashboardHeadlessLoopback {
         $state[$Username].HeadlessArmed = $true
         $state[$Username].HeadlessProcessId = $rdp.ProcessId
         $state[$Username].StopRequested = $false
+        $state[$Username].LastHeadlessArmError = $null
         Save-DashboardState -State $state
     }
     return $rdp
