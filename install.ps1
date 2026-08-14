@@ -65,6 +65,24 @@ try {
         Invoke-WebRequest -Uri $uri -OutFile $destination -UseBasicParsing
     }
 
+    # BetterRDP host-side tweaks live in a subfolder and aren't fetched by
+    # the loop above; Install-MultiSessionDashboard.ps1 looks for them at
+    # '$PSScriptRoot\BetterRDP\...', so stage them into the same relative
+    # spot here. Best-effort: a fetch failure here shouldn't block the core
+    # dashboard install, so it's reported as a warning, not a thrown error.
+    $betterRdpStagingDir = Join-Path $staging 'BetterRDP'
+    New-Item -ItemType Directory -Path $betterRdpStagingDir -Force | Out-Null
+    foreach ($betterRdpFile in @('BetterRDP.ps1', 'UpinelBetterRDP.reg')) {
+        $uri = "$RepoRawBaseUri/BetterRDP/$betterRdpFile"
+        $destination = Join-Path $betterRdpStagingDir $betterRdpFile
+        try {
+            Write-Host "Fetching $uri"
+            Invoke-WebRequest -Uri $uri -OutFile $destination -UseBasicParsing
+        } catch {
+            Write-Warning "Failed to fetch BetterRDP/$betterRdpFile ($($_.Exception.Message)); the dashboard's RDP Tweaks button will report it as missing until this is corrected."
+        }
+    }
+
     & (Join-Path $staging 'Install-MultiSessionDashboard.ps1') `
         -InstallRoot $InstallRoot `
         -RdpWrapperUri $RdpWrapperUri `

@@ -51,6 +51,25 @@ foreach ($backendModule in @('SessionManager.psm1', 'UserManager.psm1', 'RdpMana
     Copy-Item -LiteralPath $source -Destination (Join-Path $InstallRoot $backendModule) -Force
 }
 
+# BetterRDP host-side tweaks (scripts/BetterRDP/) aren't part of the module
+# chain above -- they're a standalone script Invoke-DashboardBetterRdpTweak
+# (RdpManager.psm1) shells out to -- but they still need to land in the
+# install root or that function (and the dashboard's "RDP Tweaks" button)
+# has nothing to run.
+$betterRdpSource = Join-Path $PSScriptRoot 'BetterRDP'
+if (Test-Path -LiteralPath $betterRdpSource) {
+    $betterRdpDestination = Join-Path $InstallRoot 'BetterRDP'
+    if (-not (Test-Path -LiteralPath $betterRdpDestination)) { New-Item -ItemType Directory -Path $betterRdpDestination -Force | Out-Null }
+    foreach ($betterRdpFile in @('BetterRDP.ps1', 'UpinelBetterRDP.reg')) {
+        $betterRdpFileSource = Join-Path $betterRdpSource $betterRdpFile
+        if (Test-Path -LiteralPath $betterRdpFileSource) {
+            Copy-Item -LiteralPath $betterRdpFileSource -Destination (Join-Path $betterRdpDestination $betterRdpFile) -Force
+        }
+    }
+} else {
+    Write-Warning "BetterRDP folder was not found next to Install-MultiSessionDashboard.ps1 at '$betterRdpSource'; the dashboard's RDP Tweaks button will report it as missing until this is corrected."
+}
+
 Write-Host 'Installing RDP Wrapper...'
 Install-RdpWrapper -Source $RdpWrapperUri -ReleaseApiUri $RdpWrapperReleaseApiUri -AssetNamePatterns $RdpWrapperAssetNamePatterns -InstallArguments $RdpWrapperInstallArguments -InstallTimeoutSeconds $RdpWrapperInstallTimeoutSeconds
 

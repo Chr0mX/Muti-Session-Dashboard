@@ -400,4 +400,48 @@ function global:Open-DashboardRdpWrapperManager {
     Start-Process -FilePath $Path | Out-Null
 }
 
+function global:Invoke-DashboardBetterRdpTweak {
+    <#
+        Runs the installed copy of BetterRDP.ps1 (scripts/BetterRDP/, see
+        Install-MultiSessionDashboard.ps1's copy step and install.ps1's
+        staging step -- neither wired this in until the "RDP Tweaks" button
+        needed it) non-interactively for the "RDP Tweaks" button.
+
+        Shells out to a child powershell.exe rather than dot-sourcing the
+        script into this runspace: BetterRDP.ps1 declares a `class` at its
+        top level, and PowerShell throws if a class with the same name is
+        defined a second time in a runspace that's already loaded it once
+        -- which background runspaces here are, since
+        Start-DashboardBackgroundTask reuses its thread/runspace machinery
+        across calls. A child process sidesteps that entirely and also
+        keeps BetterRDP.ps1's own #Requires -RunAsAdministrator check and
+        machine-wide registry writes cleanly isolated from this process.
+        The child inherits this process's elevation token automatically
+        (no separate UAC prompt), since the dashboard itself already
+        requires an elevated session (Assert-Administrator below).
+
+        Returns the script's captured Write-Host/output text as a single
+        string, which Dashboard.ps1's "RDP Tweaks" button shows directly in
+        a MessageBox -- Validate-Optimizations' pass/fail summary and
+        Apply-RDPOptimizations'/Apply-GamingRDPOptimizations' "reboot is
+        required" note are both meant to be read, not just acted on.
+    #>
+    param([Parameter(Mandatory)][ValidateSet('Backup', 'Apply', 'ApplyGaming', 'Validate')][string]$Action)
+    Assert-Administrator
+
+    $scriptPath = Join-Path (Get-DashboardInstallRoot) 'BetterRDP\BetterRDP.ps1'
+    if (-not (Test-Path -LiteralPath $scriptPath)) {
+        throw "BetterRDP tweaks script was not found at '$scriptPath'. Re-run the installer (irm ... | iex, or Install-MultiSessionDashboard.ps1 from a checkout) to fetch it."
+    }
+
+    $psExe = Join-Path $PSHOME 'powershell.exe'
+    if (-not (Test-Path -LiteralPath $psExe)) { $psExe = 'powershell.exe' }
+
+    $output = & $psExe -NoProfile -ExecutionPolicy Bypass -File $scriptPath -Action $Action 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+        throw "BetterRDP tweaks ($Action) exited with code ${LASTEXITCODE}:`n$output"
+    }
+    return $output.Trim()
+}
+
 Export-ModuleMember -Function *
