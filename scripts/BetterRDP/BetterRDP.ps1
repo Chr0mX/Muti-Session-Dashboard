@@ -19,6 +19,22 @@
 
 #Requires -RunAsAdministrator
 
+[CmdletBinding()]
+param(
+    # Non-interactive mode: skip the Read-Host menu below and run exactly
+    # one action, then exit. Used by Invoke-DashboardBetterRdpTweak
+    # (RdpManager.psm1) so the dashboard's "RDP Tweaks" button can drive
+    # this script from a background runspace, where a Read-Host prompt
+    # would just hang forever with nobody to answer it. Left unset (the
+    # default), the script behaves exactly as it always has: it shows the
+    # 1-6 menu and reads a console choice. Restore isn't offered here since
+    # it needs a backup file path to pick, which the interactive menu
+    # already handles by looking next to itself -- run the script directly
+    # (no -Action) for that.
+    [ValidateSet('Backup', 'Apply', 'ApplyGaming', 'Validate')]
+    [string]$Action
+)
+
 class RegistryState {
     [string]$Path
     [string]$Name
@@ -576,6 +592,31 @@ function Apply-GamingRDPOptimizations {
 
 # Main script execution
 $ErrorActionPreference = "Stop"
+
+if ($PSBoundParameters.ContainsKey('Action')) {
+    switch ($Action) {
+        'Backup' {
+            Write-Host "Creating backup..." -ForegroundColor Yellow
+            $backupPath = Backup-RegistrySettings
+            if (Validate-Backup -BackupFile $backupPath) {
+                Write-Host "Backup created successfully at: $backupPath" -ForegroundColor Green
+            }
+        }
+        'Apply' {
+            Write-Host "Applying default RDP optimizations..." -ForegroundColor Yellow
+            Apply-RDPOptimizations
+        }
+        'ApplyGaming' {
+            Write-Host "Applying gaming RDP optimizations..." -ForegroundColor Yellow
+            Apply-GamingRDPOptimizations
+        }
+        'Validate' {
+            Write-Host "Validating optimization status..." -ForegroundColor Yellow
+            Validate-Optimizations
+        }
+    }
+    return
+}
 
 Write-Host "BetterRDP Optimization Script" -ForegroundColor Green
 Write-Host "1. Create backup only"

@@ -252,7 +252,7 @@ function Invoke-DashboardActionAsync {
         [Parameter(Mandatory)][hashtable]$Params,
         [Parameter(Mandatory)][string]$Success
     )
-    $actionButtons = @($create, $start, $rdp, $stop, $refresh, $openWrapper)
+    $actionButtons = @($create, $start, $rdp, $stop, $refresh, $openWrapper, $tweaks)
     foreach ($button in $actionButtons) { $button.Enabled = $false }
     $script:DashboardActionInProgress = $true
     if ($Params.ContainsKey('Username')) { Set-Status "Working on $($Params.Username)..." } else { Set-Status 'Working...' }
@@ -290,6 +290,35 @@ function Invoke-DashboardActionAsync {
     $onComplete = { & $completeActionRef -Buttons $actionButtons }.GetNewClosure()
 
     Start-DashboardBackgroundTask -Command $Command -Params $Params -Control $form `
+        -OnSuccess $onSuccess -OnError $onError -OnComplete $onComplete
+}
+
+function Invoke-DashboardBetterRdpTweaksAsync {
+    <#
+        Same shape as Invoke-DashboardActionAsync (background dispatch,
+        buttons disabled for the duration, ${function:Name} + `&`
+        invocation inside every .GetNewClosure()'d callback -- see that
+        function's comment for why bare-name calls inside a closure aren't
+        reliable on the real target platform), except -OnSuccess shows the
+        BetterRDP script's own captured output in a MessageBox instead of a
+        fixed status string: Validate's pass/fail summary and Apply's
+        "reboot is required" note are the actual point of clicking this
+        button, not just a generic "it worked".
+    #>
+    param([Parameter(Mandatory)][string]$Action)
+    $actionButtons = @($create, $start, $rdp, $stop, $refresh, $openWrapper, $tweaks)
+    foreach ($button in $actionButtons) { $button.Enabled = $false }
+    $script:DashboardActionInProgress = $true
+    Set-Status "Running BetterRDP tweaks ($Action)..."
+
+    $setStatusRef = ${function:Set-Status}
+    $completeActionRef = ${function:Complete-DashboardAction}
+
+    $onSuccess = { param($Result) & $setStatusRef 'BetterRDP tweaks finished'; [Windows.Forms.MessageBox]::Show([string]$Result, 'BetterRDP Tweaks') | Out-Null }.GetNewClosure()
+    $onError = { param($ErrorMessage) & $setStatusRef $ErrorMessage; [Windows.Forms.MessageBox]::Show($ErrorMessage, 'Multi Session Dashboard') | Out-Null }.GetNewClosure()
+    $onComplete = { & $completeActionRef -Buttons $actionButtons }.GetNewClosure()
+
+    Start-DashboardBackgroundTask -Command 'Invoke-DashboardBetterRdpTweak' -Params @{ Action = $Action } -Control $form `
         -OnSuccess $onSuccess -OnError $onError -OnComplete $onComplete
 }
 
@@ -390,6 +419,33 @@ $openWrapper.Size = New-Object Drawing.Size(160, 36)
 $openWrapper.Add_Click({ Invoke-DashboardActionAsync -Command 'Open-DashboardRdpWrapperManager' -Params @{} -Success 'RDP Wrapper manager opened' })
 
 $form.Controls.Add($openWrapper)
+
+
+
+$tweaks = New-Object Windows.Forms.Button
+
+$tweaks.Text = 'RDP Tweaks'
+
+$tweaks.Location = New-Object Drawing.Point(759, 370)
+
+$tweaks.Size = New-Object Drawing.Size(150, 36)
+
+# Runs scripts/BetterRDP/BetterRDP.ps1 (Upinel/BetterRDP's host-side RDP
+# performance registry tweaks) via Invoke-DashboardBetterRdpTweak
+# (RdpManager.psm1). Apply changes machine-wide registry settings and
+# needs a reboot afterward to take effect, so it's asked for explicitly
+# rather than being the default -- Validate is read-only and safe to run
+# any time, including just to check whether Apply has already been run.
+$tweaks.Add_Click({
+    $choice = [Windows.Forms.MessageBox]::Show(
+        "Yes = Apply RDP performance tweaks (machine-wide registry changes; a reboot is required afterward).`nNo = Validate only -- reports current tweak status, changes nothing.`nCancel = do nothing.",
+        'BetterRDP Tweaks', 'YesNoCancel', 'Question')
+    if ($choice -eq [Windows.Forms.DialogResult]::Cancel) { return }
+    $action = if ($choice -eq [Windows.Forms.DialogResult]::Yes) { 'Apply' } else { 'Validate' }
+    Invoke-DashboardBetterRdpTweaksAsync -Action $action
+})
+
+$form.Controls.Add($tweaks)
 
 
 
