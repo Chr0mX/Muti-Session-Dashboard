@@ -360,6 +360,12 @@ function global:Get-DefaultDashboardStateEntry {
         # to be stopped" so a session going offline after an explicit Stop
         # stays stopped instead of being re-armed headless again.
         StopRequested = $false
+        # Set by Update-DashboardMonitorState when an automatic re-arm
+        # attempt throws, so the failure is visible in the dashboard grid
+        # instead of only ever going to Write-Verbose (invisible by
+        # default, and this all runs in a background runspace with no
+        # console anyway). Cleared on the next successful arm/connect.
+        LastHeadlessArmError = $null
     }
 }
 
@@ -435,6 +441,7 @@ function global:Connect-DashboardRdp {
         $state[$Username].RdpConnectionStatus = 'Connected'
         $state[$Username].SessionState = 'Running'
         $state[$Username].StopRequested = $false
+        $state[$Username].LastHeadlessArmError = $null
         Save-DashboardState -State $state
     }
     return $rdp
@@ -512,8 +519,20 @@ function global:Update-DashboardMonitorState {
                 Wait-DashboardSessionClosed -Username $key -TimeoutSeconds 10 | Out-Null
                 Start-DashboardHeadlessLoopback -Username $key | Out-Null
                 $fresh = Get-DashboardState
-                if ($fresh.ContainsKey($key)) { $state[$key] = $fresh[$key] }
+                if ($fresh.ContainsKey($key)) {
+                    $state[$key] = $fresh[$key]
+                    $state[$key].LastHeadlessArmError = $null
+                }
             } catch {
+                # Write-Verbose alone (the previous behavior here) is
+                # invisible by default and this whole function runs in a
+                # background runspace with no console anyone would see
+                # anyway -- a silently-swallowed failure here is exactly
+                # what made a real report ("auto-arm doesn't relaunch a new
+                # RDP process") impossible to diagnose without another
+                # round trip. Surface it in the state itself instead.
+                $entry.LastHeadlessArmError = $_.Exception.Message
+                $entry.RdpConnectionStatus = 'Error'
                 Write-Verbose "Auto re-arm of headless loopback for '$key' failed: $($_.Exception.Message)"
             }
         }

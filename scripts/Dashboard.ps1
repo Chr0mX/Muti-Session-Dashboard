@@ -72,7 +72,8 @@ foreach ($column in @(
     @{ Name='RdpHostPort'; Header='RDP Endpoint'; Width=140 },
     @{ Name='RdpSessionId'; Header='RDP Session'; Width=90 },
     @{ Name='SessionState'; Header='Session'; Width=90 },
-    @{ Name='RdpConnectionStatus'; Header='RDP Status'; Width=120 }
+    @{ Name='RdpConnectionStatus'; Header='RDP Status'; Width=120 },
+    @{ Name='LastHeadlessArmError'; Header='Last Error'; Width=380 }
 )) {
     $columnObject = New-Object Windows.Forms.DataGridViewTextBoxColumn
     $columnObject.Name = $column.Name
@@ -150,6 +151,7 @@ function Refresh-Grid {
             $grid.Rows[$row].Cells['RdpSessionId'].Value = $entry.RdpSessionId
             $grid.Rows[$row].Cells['SessionState'].Value = $entry.SessionState
             $grid.Rows[$row].Cells['RdpConnectionStatus'].Value = $entry.RdpConnectionStatus
+            $grid.Rows[$row].Cells['LastHeadlessArmError'].Value = $entry.LastHeadlessArmError
         }
 
         Save-DashboardState -State $state
@@ -175,6 +177,7 @@ function Set-DashboardGridFromState {
         $row.Cells['RdpSessionId'].Value = $entry.RdpSessionId
         $row.Cells['SessionState'].Value = $entry.SessionState
         $row.Cells['RdpConnectionStatus'].Value = $entry.RdpConnectionStatus
+        $row.Cells['LastHeadlessArmError'].Value = $entry.LastHeadlessArmError
     }
 }
 

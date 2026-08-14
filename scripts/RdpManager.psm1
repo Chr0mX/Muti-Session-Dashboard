@@ -263,12 +263,23 @@ function global:Invoke-DashboardRdpBootstrap {
     # actually triggers a direct/automatic connect; a target that only
     # exists inside the referenced file appears to just pre-fill the GUI
     # for manual confirmation instead.
+    #
+    # /title: sets the window title -- distinguishing a headless anchor
+    # ("RDP-<user>-Headless") from a real interactive session
+    # ("RDP-<user>"), e.g. in Task Manager or Alt-Tab. This is on the
+    # command line, not just via the after-the-fact SetWindowText in
+    # Set-DashboardWindowProperties (kept below as a harmless backup):
+    # SetWindowText alone did not reliably show up, and /title: is a real,
+    # user-confirmed RDP+ flag (verified by direct testing, not fetched
+    # "documentation" -- see the /batch and /log note further up).
+    $windowTitle = if ($Minimize) { "RDP-$Username-Headless" } else { "RDP-$Username" }
     $rdpFile = New-DashboardRdpFile -Username $Username
     $arguments = @(
         "`"$rdpFile`"",
         "/v:$($script:RdpHost):$($script:RdpPort)",
         "/u:.\$Username",
-        "/p:$Username"
+        "/p:$Username",
+        "/title:`"$windowTitle`""
     )
 
     Write-Host "Starting Remote Desktop Plus for '$Username' at 1920x1080."
@@ -328,10 +339,8 @@ function global:Invoke-DashboardRdpBootstrap {
         throw "RDP login for '$Username' did not produce an active RDP session within 45 seconds. $processNote Detection source: $($sourceInfo.Source)$fallbackNote. Sessions observed for '$Username': $dump. Run 'query session' to compare against what Windows itself reports."
     }
 
-    # Title always gets set, whether this is a headless anchor or a real
-    # interactive session, so the two are distinguishable (e.g. in Task
-    # Manager or Alt-Tab) -- only minimizing is conditional on -Minimize.
-    $windowTitle = if ($Minimize) { "RDP-$Username-Headless" } else { "RDP-$Username" }
+    # Backup title-set (see the /title: comment above) plus the real
+    # minimize; only minimizing is conditional on -Minimize.
     Set-DashboardWindowProperties -ProcessId $process.Id -Title $windowTitle -Minimize:$Minimize
 
     return [pscustomobject]@{
