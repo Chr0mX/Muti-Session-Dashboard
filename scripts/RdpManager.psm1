@@ -167,19 +167,41 @@ public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
 [DllImport("user32.dll", CharSet = CharSet.Auto)]
 public static extern bool SetWindowText(IntPtr hWnd, string lpString);
+
+[DllImport("user32.dll")]
+public static extern int GetWindowTextLength(IntPtr hWnd);
+
+[DllImport("user32.dll", CharSet = CharSet.Auto)]
+public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
 '@
     }
 }
 
 function global:Update-DashboardWindowOnce {
     <#
-        Single pass: enumerate every top-level window owned by $ProcessId
-        (via EnumWindows + GetWindowThreadProcessId, not
-        Process.MainWindowHandle -- see Set-DashboardWindowProperties'
-        comment for why) and apply -Title/-Minimize to each match. Returns
-        the number of matching windows found, so callers can tell "process
-        alive but genuinely has no window yet" apart from "found some and
-        applied to them".
+        Single pass: enumerate every top-level window on the system and
+        apply -Title/-Minimize to each one that matches $ProcessId OR
+        $Title. Returns the number of matching windows found, so callers
+        can tell "nothing matched yet" apart from "found some and applied
+        to them".
+
+        Matching by title as well as by owning process ID is not optional
+        redundancy -- it's the actual fix for a real, confirmed report.
+        Diagnosed directly on a live system while a headless window was
+        stuck visible: RDP+'s own rdp.exe process was not running at all
+        by then (only rdpclip.exe was) -- the visible window titled
+        "RDP-<user>-Headless" was owned by mstsc.exe, a completely
+        different process the dashboard never launched or tracked a PID
+        for. RDP+ is apparently just a thin wrapper that hands the actual
+        connection off to the real Windows RDP client and exits, so
+        $ProcessId (captured from Start-Process's return value for the
+        rdp.exe launch) can legitimately never match the window that
+        actually ends up on screen. Matching by title too -- the same
+        "RDP-<user>-Headless"/"RDP-<user>" text RDP+'s own /title: flag
+        already reliably sets on whatever window it hands off to -- finds
+        it regardless of which process ends up owning it. PID matching is
+        kept alongside title matching as a harmless no-cost fallback for
+        whichever RDP+ version/build behaves differently.
     #>
     param(
         [Parameter(Mandatory)][int]$ProcessId,
@@ -192,9 +214,22 @@ function global:Update-DashboardWindowOnce {
     $handles = [System.Collections.Generic.List[IntPtr]]::new()
     $callback = [BetterRdp.Window+EnumWindowsProc]{
         param([IntPtr]$hWnd, [IntPtr]$lParam)
+        $isMatch = $false
+
         $ownerPid = [uint32]0
         [void][BetterRdp.Window]::GetWindowThreadProcessId($hWnd, [ref]$ownerPid)
-        if ($ownerPid -eq [uint32]$ProcessId) { [void]$handles.Add($hWnd) }
+        if ($ownerPid -eq [uint32]$ProcessId) { $isMatch = $true }
+
+        if (-not $isMatch -and -not [string]::IsNullOrEmpty($Title)) {
+            $length = [BetterRdp.Window]::GetWindowTextLength($hWnd)
+            if ($length -gt 0) {
+                $builder = [System.Text.StringBuilder]::new($length + 1)
+                [void][BetterRdp.Window]::GetWindowText($hWnd, $builder, $builder.Capacity)
+                if ($builder.ToString() -eq $Title) { $isMatch = $true }
+            }
+        }
+
+        if ($isMatch) { [void]$handles.Add($hWnd) }
         return $true
     }.GetNewClosure()
     [void][BetterRdp.Window]::EnumWindows($callback, [IntPtr]::Zero)
@@ -212,28 +247,26 @@ function global:Update-DashboardWindowOnce {
 
 function global:Set-DashboardWindowProperties {
     <#
-        Best-effort title-set and/or hide of every top-level window owned by
-        an rdp.exe process, re-applied every 500ms for up to $TimeoutSeconds.
-        Used right after a connect for immediate feedback -- see
-        Start-DashboardHeadlessWindowWatcher for the persistent, whole-
-        lifetime version of this used for headless loopback connections,
-        which this bounded call alone was NOT enough for in practice (a
-        real report: the headless window stayed visible indefinitely, not
-        just briefly -- RDP+ apparently can (re)show/restore its own window
-        well after this function's fixed window has already elapsed, and
-        nothing was left watching for that).
+        Best-effort title-set and/or hide of every top-level window matching
+        $ProcessId or $Title (see Update-DashboardWindowOnce for why both),
+        re-applied every 500ms for up to $TimeoutSeconds. Used right after a
+        connect for immediate feedback -- see Start-DashboardHeadlessWindowWatcher
+        for the persistent, whole-lifetime version of this used for headless
+        loopback connections, which this bounded call alone was NOT enough
+        for in practice (a real report: the headless window stayed visible
+        indefinitely, not just briefly).
 
-        Deliberately does NOT use Process.MainWindowHandle: that's a .NET
-        heuristic that picks (at most) one window per process by its own
-        rules, isn't guaranteed to track the actual final/visible window if
-        the process shows more than one top-level window over its lifetime
-        (e.g. an initial dialog later replaced by the real session view),
-        and was the previous approach here -- confirmed not reliably
-        working for hiding the window even after several rounds of
-        persistence/timeout tuning. This instead walks every top-level
-        window on the system via EnumWindows, matches by owning process ID
-        via GetWindowThreadProcessId (not any single-window heuristic), and
-        applies to every match, not just one.
+        Does NOT gate on "is $ProcessId still alive": confirmed directly on
+        a live system that it commonly is not, by the time this even starts
+        running -- RDP+'s rdp.exe process routinely exits shortly after
+        handing the actual connection off to mstsc.exe, well within the 45s
+        Wait-DashboardRdpSession already waited before this function is ever
+        called. Gating on that PID's liveness made this whole function a
+        silent no-op for exactly the case it exists to handle. Title
+        matching in Update-DashboardWindowOnce is what actually finds the
+        window now, so this just keeps re-enumerating and re-applying for
+        the whole timeout window regardless of whether $ProcessId itself
+        still exists.
     #>
     param(
         [Parameter(Mandatory)][int]$ProcessId,
@@ -244,14 +277,7 @@ function global:Set-DashboardWindowProperties {
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     do {
-        try {
-            $null = Get-Process -Id $ProcessId -ErrorAction Stop
-        } catch {
-            return
-        }
-
         Update-DashboardWindowOnce -ProcessId $ProcessId -Title $Title -Minimize:$Minimize | Out-Null
-
         Start-Sleep -Milliseconds 500
     } while ((Get-Date) -lt $deadline)
 }
@@ -259,17 +285,20 @@ function global:Set-DashboardWindowProperties {
 function global:Start-DashboardHeadlessWindowWatcher {
     <#
         Keeps re-hiding (and re-titling) an armed headless loopback's
-        window for as long as its rdp.exe process is alive -- not just for
-        a bounded window right after connect. A headless connection can
+        window for as long as one still exists -- not just for a bounded
+        window right after connect, and not gated on $ProcessId staying
+        alive (see Set-DashboardWindowProperties' comment: RDP+'s own
+        rdp.exe process commonly exits on its own shortly after handing the
+        connection off to mstsc.exe, so "is the original process still
+        alive" was never a usable stop condition -- it's often already
+        false the moment this watcher starts). A headless connection can
         stay armed for a long time (until an interactive Connect displaces
-        it or Stop tears it down), and a real report confirmed the bounded
-        Set-DashboardWindowProperties call alone wasn't enough: the window
-        was still visible, not just briefly flashing before being hidden --
-        so whatever shows/restores it can happen well outside any fixed
-        timeout this function's caller might pick. This has no such limit;
-        it just keeps polling every 750ms until the process itself exits,
-        at which point the loop (and this background runspace) ends on its
-        own -- nothing else needs to stop it.
+        it or Stop tears it down), so this instead keeps going as long as
+        Update-DashboardWindowOnce's title match keeps finding something,
+        polling every 750ms, and only gives up after several consecutive
+        misses in a row -- long enough to tolerate a brief gap before the
+        window first appears, short enough to not poll forever once the
+        headless connection has genuinely ended.
 
         Fire-and-forget by design, same shape as
         Start-DashboardBackgroundTask's use of a dedicated MTA runspace,
@@ -303,9 +332,17 @@ function global:Start-DashboardHeadlessWindowWatcher {
     [void]$ps.AddScript({
         param($ModuleRoot, $ProcessId, $Title)
         Import-Module (Join-Path $ModuleRoot 'MultiSessionDashboard.psm1') -Force
-        while ($true) {
-            try { $null = Get-Process -Id $ProcessId -ErrorAction Stop } catch { break }
-            try { Update-DashboardWindowOnce -ProcessId $ProcessId -Title $Title -Minimize | Out-Null } catch {}
+        # ~30s of consecutive misses (40 * 750ms) before giving up -- long
+        # enough that a slow-to-appear window (or a brief gap right after
+        # the bounded Set-DashboardWindowProperties call handed off here)
+        # doesn't cause a premature stop, short enough that a genuinely
+        # displaced/stopped headless connection doesn't poll forever.
+        $consecutiveMisses = 0
+        $maxConsecutiveMisses = 40
+        while ($consecutiveMisses -lt $maxConsecutiveMisses) {
+            $matched = 0
+            try { $matched = Update-DashboardWindowOnce -ProcessId $ProcessId -Title $Title -Minimize } catch {}
+            if ($matched -gt 0) { $consecutiveMisses = 0 } else { $consecutiveMisses++ }
             Start-Sleep -Milliseconds 750
         }
     })
@@ -314,10 +351,11 @@ function global:Start-DashboardHeadlessWindowWatcher {
     [void]$ps.AddArgument($Title)
 
     # Intentionally not tracked/EndInvoke'd/disposed: this loop's own exit
-    # condition (the process going away) is its only defined lifetime, and
-    # nothing here needs to react to that beyond the loop just stopping.
-    # $ps/$runspace stay referenced by the in-flight async operation itself
-    # until the script block returns, then become eligible for normal GC.
+    # condition (running out consecutive misses) is its only defined
+    # lifetime, and nothing here needs to react to that beyond the loop
+    # just stopping. $ps/$runspace stay referenced by the in-flight async
+    # operation itself until the script block returns, then become
+    # eligible for normal GC.
     [void]$ps.BeginInvoke()
 }
 
