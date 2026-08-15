@@ -180,8 +180,27 @@ function Get-RegistryState {
     $regPath = $Path -replace 'HKLM:\\', 'HKLM\'
     Write-Host "Converted path: $regPath" -ForegroundColor DarkGray
 
-    # Store reg.exe output for inspection
-    $regOutput = reg.exe query $regPath 2>&1
+    # Store reg.exe output for inspection. reg.exe query legitimately exits
+    # non-zero with an "unable to find the specified registry key" message
+    # on its error stream whenever a key just doesn't exist yet -- that's
+    # exactly what $state.ParentExists below exists to detect, not a real
+    # failure. Under the script-level $ErrorActionPreference = "Stop" (set
+    # near the bottom of this file), merging that stderr text into the
+    # pipeline via 2>&1 makes PowerShell treat each stderr line as a
+    # terminating ErrorRecord the instant it's assigned to $regOutput --
+    # confirmed by a live crash report, where the very first genuinely
+    # missing key (TermDD, on a system that hadn't had any tweak applied
+    # yet) took the whole Apply/Validate run down instead of just being
+    # recorded as "doesn't exist". Scope 'Continue' to just this call so
+    # reg.exe's expected non-zero exits stay non-fatal here without
+    # weakening $ErrorActionPreference anywhere else in the script.
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $regOutput = reg.exe query $regPath 2>&1
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
     $state.ParentExists = $LASTEXITCODE -eq 0
 
     Write-Host "reg.exe exit code: $LASTEXITCODE" -ForegroundColor DarkGray
