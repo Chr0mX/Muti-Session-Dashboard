@@ -109,6 +109,8 @@ $form.Controls.Add($status)
 # as before.
 $script:DashboardActionInProgress = $false
 $script:MonitorTaskInFlight = $false
+$script:AllowExit = $false
+$script:HasShownTrayHint = $false
 
 function Set-Status([string]$Text) { $status.Text = $Text; $form.Refresh() }
 
@@ -446,6 +448,81 @@ $tweaks.Add_Click({
 })
 
 $form.Controls.Add($tweaks)
+
+
+
+# System tray integration: minimizing the window OR closing it (the X
+# button) both hide it to the tray instead of ending the process. This
+# matters here specifically because the background monitor -- auto-arming
+# every RDS user's headless loopback, keeping its window hidden (see
+# Start-DashboardHeadlessWindowWatcher) -- only runs for as long as this
+# process is alive. Closing the window used to mean losing all of that;
+# now the only way to actually end the process is the tray icon's own
+# "Exit" item (or Task Manager), so an operator who just wants the window
+# out of the way doesn't have to think about that tradeoff.
+$notifyIcon = New-Object Windows.Forms.NotifyIcon
+$notifyIcon.Icon = [System.Drawing.SystemIcons]::Application
+$notifyIcon.Text = 'Multi Session Dashboard'
+$notifyIcon.Visible = $true
+
+$trayMenu = New-Object Windows.Forms.ContextMenuStrip
+$trayOpenItem = $trayMenu.Items.Add('Open Dashboard')
+$trayExitItem = $trayMenu.Items.Add('Exit')
+$notifyIcon.ContextMenuStrip = $trayMenu
+
+function Show-DashboardWindow {
+    $form.Show()
+    $form.WindowState = [Windows.Forms.FormWindowState]::Normal
+    $form.Activate()
+}
+
+function Set-DashboardTrayHintShown {
+    <#
+        Plain top-level function, not inline in an event handler, for the
+        same reason Complete-DashboardAction is: a $script: write is
+        reliable here either way since these tray event handlers aren't
+        .GetNewClosure()'d (same as every other Add_Click handler in this
+        file), but keeping every $script: write behind a plain function
+        matches this file's established "same safe shape everywhere"
+        convention rather than relying on that distinction staying true.
+    #>
+    $script:HasShownTrayHint = $true
+}
+
+function Set-DashboardAllowExit {
+    $script:AllowExit = $true
+}
+
+function Hide-DashboardWindowToTray {
+    $form.Hide()
+    if (-not $script:HasShownTrayHint) {
+        $notifyIcon.ShowBalloonTip(3000, 'Multi Session Dashboard', 'Still running in the background -- double-click this icon to reopen.', [Windows.Forms.ToolTipIcon]::Info)
+        Set-DashboardTrayHintShown
+    }
+}
+
+$trayOpenItem.Add_Click({ Show-DashboardWindow })
+$notifyIcon.Add_DoubleClick({ Show-DashboardWindow })
+
+$trayExitItem.Add_Click({
+    Set-DashboardAllowExit
+    $notifyIcon.Visible = $false
+    $form.Close()
+})
+
+$form.Add_Resize({
+    if ($form.WindowState -eq [Windows.Forms.FormWindowState]::Minimized) { Hide-DashboardWindowToTray }
+})
+
+$form.Add_FormClosing({
+    param($senderObj, $eventArgs)
+    if (-not $script:AllowExit -and $eventArgs.CloseReason -eq [Windows.Forms.CloseReason]::UserClosing) {
+        $eventArgs.Cancel = $true
+        Hide-DashboardWindowToTray
+    } else {
+        $notifyIcon.Visible = $false
+    }
+})
 
 
 

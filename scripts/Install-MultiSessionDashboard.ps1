@@ -40,6 +40,17 @@ foreach ($directory in $directories) {
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Dashboard.ps1') -Destination (Join-Path $InstallRoot 'Dashboard.ps1') -Force
 Copy-Item -LiteralPath $modulePath -Destination (Join-Path $InstallRoot 'MultiSessionDashboard.psm1') -Force
 
+# Self-elevating launcher so the dashboard can be started with a double-click
+# (or a desktop/Start Menu shortcut to this file) instead of having to open
+# an elevated PowerShell prompt and type the full powershell.exe -File "..."
+# command line every time.
+$launcherSource = Join-Path $PSScriptRoot 'Launch-Dashboard.bat'
+if (Test-Path -LiteralPath $launcherSource) {
+    Copy-Item -LiteralPath $launcherSource -Destination (Join-Path $InstallRoot 'Launch-Dashboard.bat') -Force
+} else {
+    Write-Warning "Launch-Dashboard.bat was not found next to Install-MultiSessionDashboard.ps1 at '$launcherSource'; the dashboard will still work via Dashboard.ps1 directly."
+}
+
 # MultiSessionDashboard.psm1 is only the coordinator; it loads these four
 # focused backend modules from the same directory it's running from, so
 # they need to land alongside it in the install root too.
