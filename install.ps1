@@ -56,6 +56,7 @@ try {
         'RdpManager.psm1',
         'HeadlessManager.psm1',
         'Dashboard.ps1',
+        'Launch-Dashboard.bat',
         'Install-MultiSessionDashboard.ps1'
     )
     foreach ($file in $files) {

@@ -25,6 +25,7 @@ The installer creates the following system-wide layout:
 ```text
 C:\Program Files\Muti Session Dashboard\
 ├── Dashboard.ps1
+├── Launch-Dashboard.bat
 ├── MultiSessionDashboard.psm1
 ├── SessionManager.psm1
 ├── UserManager.psm1
@@ -43,7 +44,9 @@ RDP Wrapper is installed separately at `C:\Program Files\RDP Wrapper`, resolved 
 
 - `install.ps1` is the URL-based entry point (`irm ... | iex`). It stages the scripts below from raw GitHub and runs the installer, so it doubles as the update command.
 - `scripts/Install-MultiSessionDashboard.ps1` downloads, installs, configures, and verifies RDP Wrapper and Remote Desktop Plus, and installs the dashboard, including all four backend modules below.
-- `scripts/Dashboard.ps1` is the WinForms UI **only** — Create User, Start, Connect RDP, Stop, Refresh, and Open RDP Wrapper buttons, a grid, and a 2-second status timer. It holds no session-management logic itself; every button click and every timer tick just dispatches a named module command and renders whatever comes back.
+- `scripts/Launch-Dashboard.bat` is the recommended way to start the dashboard day to day: double-click it (or a shortcut to it) and it self-elevates (a UAC prompt, via `Start-Process -Verb RunAs`) before launching `Dashboard.ps1` — no need to open an elevated PowerShell prompt and type the full command line every time.
+- `scripts/Dashboard.ps1` is the WinForms UI **only** — Create User, Start, Connect RDP, Stop, Refresh, Open RDP Wrapper, and RDP Tweaks buttons, a grid, and a 2-second status timer. It holds no session-management logic itself; every button click and every timer tick just dispatches a named module command and renders whatever comes back.
+  - **Minimizing or closing the window (the X button) both hide it to the system tray instead of ending the process** — the background monitor (auto-arming every RDS user's headless loopback, keeping its window hidden) only runs while the process is alive, so closing the window used to mean losing that. Double-click the tray icon, or use its "Open Dashboard" menu item, to bring the window back. The tray icon's own **Exit** item (or Task Manager) is the only way to actually end the process now.
   - Both **Start** and **Connect RDP** launch [Remote Desktop Plus](https://www.donkz.nl/) (`rdp.exe`) against `127.0.0.2:3389` with the account's username passed as both `/u:` and `/p:` (plus a generated `.rdp` file carrying settings like `smart sizing:i:1` that have no dedicated CLI flag), so the login is fully automatic — no saved-credential prompt to click through. Dashboard-created accounts always get the username as their Windows password so this always succeeds.
   - **Start** arms a **headless RDP loopback**: the same automated login, launched minimized so no RDP window appears (window title `RDP-<user>-Headless`), then verified by polling the account's real, live-detected session ID (never a hard-coded session number) until it shows up Active. This keeps the user's session alive and "ready" without anyone looking at it. See [Headless RDP Loopback](#headless-rdp-loopback) below. In practice this is a manual "do it now" shortcut — every RDS user gets armed automatically anyway (see the background monitor below).
   - **Connect RDP** launches a real, visible, interactive client (window title `RDP-<user>`). Reconnecting to a session that already exists — whether disconnected or headless-armed — takes it over: standard RDP behavior, where a new client connecting to an existing session disconnects whichever client held it before. So Connect RDP alone (without ever pressing Start first) still works exactly like a normal connect/reconnect.
@@ -110,7 +113,7 @@ irm https://raw.githubusercontent.com/Chr0mX/Muti-Session-Dashboard/main/install
 
 The same command is used to update: it re-runs the installer over the existing installation.
 
-Then launch the dashboard:
+Then launch the dashboard by double-clicking `C:\Program Files\Muti Session Dashboard\Launch-Dashboard.bat` (it self-elevates, so a UAC prompt is expected) — or, equivalently, from an already-elevated PowerShell prompt:
 
 ```powershell
 powershell.exe -ExecutionPolicy Bypass -File "C:\Program Files\Muti Session Dashboard\Dashboard.ps1"
