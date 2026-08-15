@@ -136,52 +136,14 @@ function global:New-DashboardRdpFile {
     return $path
 }
 
-function global:Set-DashboardWindowProperties {
+function global:Add-DashboardWindowType {
     <#
-        Best-effort title-set and/or hide of every top-level window owned by
-        an rdp.exe process. Used for two things:
-          - Giving every RDP+ window a distinguishable title
-            ("RDP-<user>-Headless" for an armed headless loopback,
-            "RDP-<user>" for a real interactive session), via SetWindowText
-            -- a harmless backup here; the primary title mechanism is
-            RDP+'s own /title: command-line flag, set in
-            Invoke-DashboardRdpBootstrap.
-          - Keeping an "armed" headless loopback connection fully out of
-            the operator's way, via ShowWindow(SW_HIDE) (no taskbar entry
-            at all, not just minimized), when -Minimize is passed. This is
-            the ONLY hide mechanism -Minimize uses -- see
-            Invoke-DashboardRdpBootstrap's comment for why Start-Process
-            -WindowStyle Minimized was tried and reverted (it crashes RDP+
-            outright, a real bug in RDP+'s own startup code).
-
-        Deliberately does NOT use Process.MainWindowHandle: that's a .NET
-        heuristic that picks (at most) one window per process by its own
-        rules, isn't guaranteed to track the actual final/visible window if
-        the process shows more than one top-level window over its lifetime
-        (e.g. an initial dialog later replaced by the real session view),
-        and was the previous approach here -- confirmed not reliably
-        working for hiding the window even after several rounds of
-        persistence/timeout tuning. This instead walks every top-level
-        window on the system via EnumWindows, matches by owning process ID
-        via GetWindowThreadProcessId (not any single-window heuristic), and
-        applies to every match, not just one.
-
-        A single one-shot "find the handle(s) once, apply, and stop" was
-        not enough in practice either: a window that appears late (or gets
-        replaced/re-shown partway through RDP negotiation) can end up
-        visible anyway. This keeps re-enumerating and re-applying for the
-        whole timeout window -- cheap and idempotent -- rather than a
-        single pass. Failure here is still non-fatal -- the RDP session
-        itself is what matters; a window whose title/visibility couldn't be
-        set is just a cosmetic miss.
+        Shared by Set-DashboardWindowProperties and
+        Start-DashboardHeadlessWindowWatcher -- split out so the watcher's
+        background runspace (which imports this module fresh, same as
+        every Start-DashboardBackgroundTask consumer) can call it too
+        without duplicating the Add-Type block.
     #>
-    param(
-        [Parameter(Mandatory)][int]$ProcessId,
-        [string]$Title,
-        [switch]$Minimize,
-        [int]$TimeoutSeconds = 20
-    )
-
     if (-not ('BetterRdp.Window' -as [type])) {
         # No -UsingNamespace: Add-Type -MemberDefinition already includes
         # `using System.Runtime.InteropServices;` by default, and passing
@@ -207,7 +169,78 @@ public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 public static extern bool SetWindowText(IntPtr hWnd, string lpString);
 '@
     }
+}
+
+function global:Update-DashboardWindowOnce {
+    <#
+        Single pass: enumerate every top-level window owned by $ProcessId
+        (via EnumWindows + GetWindowThreadProcessId, not
+        Process.MainWindowHandle -- see Set-DashboardWindowProperties'
+        comment for why) and apply -Title/-Minimize to each match. Returns
+        the number of matching windows found, so callers can tell "process
+        alive but genuinely has no window yet" apart from "found some and
+        applied to them".
+    #>
+    param(
+        [Parameter(Mandatory)][int]$ProcessId,
+        [string]$Title,
+        [switch]$Minimize
+    )
+    Add-DashboardWindowType
     $SW_HIDE = 0
+
+    $handles = [System.Collections.Generic.List[IntPtr]]::new()
+    $callback = [BetterRdp.Window+EnumWindowsProc]{
+        param([IntPtr]$hWnd, [IntPtr]$lParam)
+        $ownerPid = [uint32]0
+        [void][BetterRdp.Window]::GetWindowThreadProcessId($hWnd, [ref]$ownerPid)
+        if ($ownerPid -eq [uint32]$ProcessId) { [void]$handles.Add($hWnd) }
+        return $true
+    }.GetNewClosure()
+    [void][BetterRdp.Window]::EnumWindows($callback, [IntPtr]::Zero)
+
+    foreach ($handle in $handles) {
+        if (-not [string]::IsNullOrEmpty($Title)) {
+            [BetterRdp.Window]::SetWindowText($handle, $Title) | Out-Null
+        }
+        if ($Minimize) {
+            [BetterRdp.Window]::ShowWindow($handle, $SW_HIDE) | Out-Null
+        }
+    }
+    return $handles.Count
+}
+
+function global:Set-DashboardWindowProperties {
+    <#
+        Best-effort title-set and/or hide of every top-level window owned by
+        an rdp.exe process, re-applied every 500ms for up to $TimeoutSeconds.
+        Used right after a connect for immediate feedback -- see
+        Start-DashboardHeadlessWindowWatcher for the persistent, whole-
+        lifetime version of this used for headless loopback connections,
+        which this bounded call alone was NOT enough for in practice (a
+        real report: the headless window stayed visible indefinitely, not
+        just briefly -- RDP+ apparently can (re)show/restore its own window
+        well after this function's fixed window has already elapsed, and
+        nothing was left watching for that).
+
+        Deliberately does NOT use Process.MainWindowHandle: that's a .NET
+        heuristic that picks (at most) one window per process by its own
+        rules, isn't guaranteed to track the actual final/visible window if
+        the process shows more than one top-level window over its lifetime
+        (e.g. an initial dialog later replaced by the real session view),
+        and was the previous approach here -- confirmed not reliably
+        working for hiding the window even after several rounds of
+        persistence/timeout tuning. This instead walks every top-level
+        window on the system via EnumWindows, matches by owning process ID
+        via GetWindowThreadProcessId (not any single-window heuristic), and
+        applies to every match, not just one.
+    #>
+    param(
+        [Parameter(Mandatory)][int]$ProcessId,
+        [string]$Title,
+        [switch]$Minimize,
+        [int]$TimeoutSeconds = 20
+    )
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     do {
@@ -217,27 +250,75 @@ public static extern bool SetWindowText(IntPtr hWnd, string lpString);
             return
         }
 
-        $handles = [System.Collections.Generic.List[IntPtr]]::new()
-        $callback = [BetterRdp.Window+EnumWindowsProc]{
-            param([IntPtr]$hWnd, [IntPtr]$lParam)
-            $ownerPid = [uint32]0
-            [void][BetterRdp.Window]::GetWindowThreadProcessId($hWnd, [ref]$ownerPid)
-            if ($ownerPid -eq [uint32]$ProcessId) { [void]$handles.Add($hWnd) }
-            return $true
-        }.GetNewClosure()
-        [void][BetterRdp.Window]::EnumWindows($callback, [IntPtr]::Zero)
-
-        foreach ($handle in $handles) {
-            if (-not [string]::IsNullOrEmpty($Title)) {
-                [BetterRdp.Window]::SetWindowText($handle, $Title) | Out-Null
-            }
-            if ($Minimize) {
-                [BetterRdp.Window]::ShowWindow($handle, $SW_HIDE) | Out-Null
-            }
-        }
+        Update-DashboardWindowOnce -ProcessId $ProcessId -Title $Title -Minimize:$Minimize | Out-Null
 
         Start-Sleep -Milliseconds 500
     } while ((Get-Date) -lt $deadline)
+}
+
+function global:Start-DashboardHeadlessWindowWatcher {
+    <#
+        Keeps re-hiding (and re-titling) an armed headless loopback's
+        window for as long as its rdp.exe process is alive -- not just for
+        a bounded window right after connect. A headless connection can
+        stay armed for a long time (until an interactive Connect displaces
+        it or Stop tears it down), and a real report confirmed the bounded
+        Set-DashboardWindowProperties call alone wasn't enough: the window
+        was still visible, not just briefly flashing before being hidden --
+        so whatever shows/restores it can happen well outside any fixed
+        timeout this function's caller might pick. This has no such limit;
+        it just keeps polling every 750ms until the process itself exits,
+        at which point the loop (and this background runspace) ends on its
+        own -- nothing else needs to stop it.
+
+        Fire-and-forget by design, same shape as
+        Start-DashboardBackgroundTask's use of a dedicated MTA runspace,
+        except there's no -OnSuccess/-OnError/-OnComplete to wire up here:
+        nothing needs to observe this loop's completion, only its ongoing
+        side effect (the window staying hidden). Started from
+        Invoke-DashboardRdpBootstrap immediately after the existing bounded
+        Set-DashboardWindowProperties call, only when -Minimize was used.
+    #>
+    param([Parameter(Mandatory)][int]$ProcessId, [string]$Title)
+
+    # Prefer this module file's own directory (works from a local checkout
+    # too, not just an installed copy), same reasoning as
+    # Start-DashboardBackgroundTask in MultiSessionDashboard.psm1 -- but
+    # unlike that function, this one can't fall back to $script:InstallRoot
+    # directly: that variable belongs to MultiSessionDashboard.psm1's own
+    # script scope, not this module's, and Set-StrictMode -Version Latest
+    # throws on referencing it from here (confirmed by reproducing it).
+    # Get-DashboardInstallRoot is the kernel's own accessor for the same
+    # value, safe to call from any module.
+    $moduleRoot = Get-DashboardInstallRoot
+    if ($PSScriptRoot) { $moduleRoot = $PSScriptRoot }
+
+    $runspace = [runspacefactory]::CreateRunspace()
+    $runspace.ApartmentState = [System.Threading.ApartmentState]::MTA
+    $runspace.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::ReuseThread
+    $runspace.Open()
+
+    $ps = [powershell]::Create()
+    $ps.Runspace = $runspace
+    [void]$ps.AddScript({
+        param($ModuleRoot, $ProcessId, $Title)
+        Import-Module (Join-Path $ModuleRoot 'MultiSessionDashboard.psm1') -Force
+        while ($true) {
+            try { $null = Get-Process -Id $ProcessId -ErrorAction Stop } catch { break }
+            try { Update-DashboardWindowOnce -ProcessId $ProcessId -Title $Title -Minimize | Out-Null } catch {}
+            Start-Sleep -Milliseconds 750
+        }
+    })
+    [void]$ps.AddArgument($moduleRoot)
+    [void]$ps.AddArgument($ProcessId)
+    [void]$ps.AddArgument($Title)
+
+    # Intentionally not tracked/EndInvoke'd/disposed: this loop's own exit
+    # condition (the process going away) is its only defined lifetime, and
+    # nothing here needs to react to that beyond the loop just stopping.
+    # $ps/$runspace stay referenced by the in-flight async operation itself
+    # until the script block returns, then become eligible for normal GC.
+    [void]$ps.BeginInvoke()
 }
 
 function global:Invoke-DashboardRdpBootstrap {
@@ -379,6 +460,17 @@ function global:Invoke-DashboardRdpBootstrap {
     # Backup title-set (see the /title: comment above) plus the real
     # minimize; only minimizing is conditional on -Minimize.
     Set-DashboardWindowProperties -ProcessId $process.Id -Title $windowTitle -Minimize:$Minimize
+
+    # A bounded pass right after connect isn't enough on its own for a
+    # headless anchor -- confirmed by a real report where the window
+    # stayed visible, not just briefly, well past when the call above
+    # would have stopped trying. A headless connection can also sit armed
+    # for a long time before anything displaces it, so keep watching (and
+    # re-hiding) it for as long as its process lives, not just for the
+    # first ~20 seconds after connect.
+    if ($Minimize) {
+        Start-DashboardHeadlessWindowWatcher -ProcessId $process.Id -Title $windowTitle
+    }
 
     return [pscustomobject]@{
         Username  = $session.Username
